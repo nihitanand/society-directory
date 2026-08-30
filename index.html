@@ -12,6 +12,8 @@
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
   <style>
     :root { --gold:#B8860B; --gold-light:#D4A017; --gold-pale:#F5E6C0; --cream:#FAF7F2; --dark:#1A1410; }
     * { box-sizing:border-box; }
@@ -55,7 +57,7 @@ firebase.initializeApp(FIREBASE_CONFIG);
 const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v1.2";
+const APP_VERSION = "v1.3";
 
 const { useState, useEffect } = React;
 
@@ -379,6 +381,120 @@ function App() {
     XLSX.utils.book_append_sheet(wb,ws,"Resident Directory");
     XLSX.writeFile(wb,`RCCP_Directory_${new Date().toISOString().slice(0,10)}.xlsx`);
     notify("Excel downloaded!");
+  };
+
+  /* PDF status report — direct file download (jsPDF) */
+  const downloadPdfReport = () => {
+    const f = pdfFilter;
+    const sel = records
+      .filter(r => f==="All" || (r.status||"Pending")===f)
+      .sort((a,b)=> (a.tower||"").localeCompare(b.tower||"") || (a.unitNo||"").localeCompare(b.unitNo||""));
+    if(!sel.length){ notify("No records for this filter","error"); return; }
+    if(!window.jspdf || !window.jspdf.jsPDF){ notify("PDF library not loaded — retry","error"); return; }
+
+    const cP=records.filter(r=>(r.status||"Pending")==="Pending").length;
+    const cC=records.filter(r=>r.status==="Confirmed").length;
+    const cU=records.filter(r=>r.status==="Updated").length;
+    const resp=cC+cU, pct=records.length?Math.round(resp/records.length*100):0;
+
+    const doc = new window.jspdf.jsPDF({orientation:"p",unit:"mm",format:"a4"});
+    const W = doc.internal.pageSize.getWidth();
+    const M = 12;
+    const NAVY=[26,37,47], GREY=[85,85,85];
+    const FILL={Pending:[254,243,199],Confirmed:[209,250,229],Updated:[219,234,254]};
+    const TEXTC={Pending:[146,64,14],Confirmed:[6,95,70],Updated:[30,64,175]};
+
+    let y = 16;
+    doc.setFont("helvetica","bold"); doc.setFontSize(14); doc.setTextColor(...NAVY);
+    doc.text("CCPT Awasiya Parisar Sanrakshan Association", W/2, y, {align:"center"});
+    y += 5;
+    doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor(...GREY);
+    doc.text("The Residency Apartment, City Centre, Patna", W/2, y, {align:"center"});
+    y += 3;
+    doc.setDrawColor(...NAVY); doc.setLineWidth(0.6); doc.line(M, y, W-M, y);
+    y += 7;
+    doc.setFont("helvetica","bold"); doc.setFontSize(12); doc.setTextColor(...NAVY);
+    doc.text("RESIDENT DIRECTORY \u2014 STATUS REPORT", W/2, y, {align:"center"});
+    y += 5;
+    doc.setFont("helvetica","normal"); doc.setFontSize(9); doc.setTextColor(...GREY);
+    doc.text("Filter applied: "+f+"   |   "+sel.length+" of "+records.length+" flats", W/2, y, {align:"center"});
+    y += 5;
+
+    doc.autoTable({
+      startY: y,
+      head: [["Total Flats","Pending","Confirmed","Updated","Responded"]],
+      body: [[String(records.length),String(cP),String(cC),String(cU),resp+" ("+pct+"%)"]],
+      theme: "grid",
+      styles:{fontSize:9,halign:"center",valign:"middle",cellPadding:2.2,lineColor:[154,165,173],lineWidth:0.2},
+      headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold"},
+      bodyStyles:{fontStyle:"bold",textColor:NAVY},
+      margin:{left:M,right:M},
+      didParseCell:d=>{
+        if(d.section!=="body") return;
+        if(d.column.index===1) d.cell.styles.fillColor=FILL.Pending;
+        if(d.column.index===2) d.cell.styles.fillColor=FILL.Confirmed;
+        if(d.column.index===3) d.cell.styles.fillColor=FILL.Updated;
+        if(d.column.index===4) d.cell.styles.fillColor=[229,231,235];
+      }
+    });
+    y = doc.lastAutoTable.finalY + 5;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8); doc.setTextColor(...GREY);
+    doc.text(doc.splitTextToSize(
+      "Contact details (mobile / email) are intentionally excluded from this report. Residents can review and update their own details at residencyccpt.netlify.app.",
+      W-2*M), M, y);
+    y += 13;
+
+    ["A","B"].forEach(tw=>{
+      const sub = sel.filter(r=>r.tower===tw);
+      if(!sub.length) return;
+      if(y > doc.internal.pageSize.getHeight()-40){ doc.addPage(); y = 16; }
+      doc.setFont("helvetica","bold"); doc.setFontSize(10.5); doc.setTextColor(...NAVY);
+      doc.text("Tower "+tw+" \u2014 "+sub.length+" flats", M, y);
+      y += 2;
+      doc.autoTable({
+        startY: y+1,
+        head: [["#","Flat No.","Tower","Owner Name","Status","Locked","Last Updated"]],
+        body: sub.map((r,i)=>[String(i+1), r.unitNo||"", r.tower||"", r.ownerName||"\u2014",
+                              r.status||"Pending", r.locked?"Yes":"\u2014", normTs(r.lastUpdated)]),
+        theme:"grid",
+        styles:{fontSize:8,cellPadding:1.8,valign:"middle",lineColor:[154,165,173],lineWidth:0.2,overflow:"linebreak"},
+        headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:8},
+        alternateRowStyles:{fillColor:[244,247,250]},
+        columnStyles:{
+          0:{cellWidth:8,halign:"center"},
+          1:{cellWidth:24,halign:"center",fontStyle:"bold"},
+          2:{cellWidth:13,halign:"center"},
+          3:{cellWidth:52},
+          4:{cellWidth:22,halign:"center",fontStyle:"bold"},
+          5:{cellWidth:16,halign:"center"},
+          6:{cellWidth:51}
+        },
+        margin:{left:M,right:M},
+        didParseCell:d=>{
+          if(d.section==="body" && d.column.index===4){
+            const s=d.cell.raw;
+            if(FILL[s]){ d.cell.styles.fillColor=FILL[s]; d.cell.styles.textColor=TEXTC[s]; }
+          }
+        }
+      });
+      y = doc.lastAutoTable.finalY + 8;
+    });
+
+    const pages = doc.internal.getNumberOfPages();
+    for(let i=1;i<=pages;i++){
+      doc.setPage(i);
+      const H = doc.internal.pageSize.getHeight();
+      doc.setDrawColor(204,204,204); doc.setLineWidth(0.2); doc.line(M,H-11,W-M,H-11);
+      doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor(...GREY);
+      doc.text("CCPT Resident Directory \u2014 Status Report ("+f+")", M, H-7);
+      doc.text("Page "+i+" of "+pages, W-M, H-7, {align:"right"});
+    }
+
+    const d=new Date();
+    const stamp=d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+    doc.save("CCPT_Directory_"+f+"_"+stamp+".pdf");
+    setModal(null);
+    notify("\u2705 PDF downloaded!");
   };
 
   /* PDF status report — no contact details */
@@ -845,7 +961,8 @@ function App() {
             </div>
             <div className="flex gap-3 pt-2 border-t border-amber-100">
               <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
-              <button onClick={exportPdfReport} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">Generate Report</button>
+              <button onClick={exportPdfReport} className="flex-1 py-2.5 bg-slate-700 hover:bg-slate-600 text-white rounded-xl text-sm font-semibold">👁️ Preview</button>
+              <button onClick={downloadPdfReport} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">📥 Download</button>
             </div>
           </div>
         </Modal>
