@@ -55,13 +55,22 @@ firebase.initializeApp(FIREBASE_CONFIG);
 const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v1.1";
+const APP_VERSION = "v1.2";
 
 const { useState, useEffect } = React;
 
 const toArr = v => { if(!v) return []; if(Array.isArray(v)) return v.filter(Boolean); if(typeof v==="object") return Object.values(v).filter(Boolean); return []; };
 const uid   = () => Math.random().toString(36).slice(2,9);
 const tsNow = () => new Date().toLocaleString("en-IN",{timeZone:"Asia/Kolkata",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"});
+/* normalise mixed legacy timestamps -> "26 Apr 26, 6:03 PM" */
+const normTs = (s) => {
+  if(!s) return "\u2014";
+  const t = String(s).replace(" at ", ", ").trim();
+  const m = t.match(/(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4}),?\s*(\d{1,2}):(\d{2})\s*([AaPp])\.?[Mm]\.?/);
+  if(!m) return t;
+  const d=m[1], mon=m[2], yr=m[3], hh=String(Number(m[4])), mi=m[5], ap=m[6].toUpperCase();
+  return Number(d)+" "+mon.charAt(0).toUpperCase()+mon.slice(1).toLowerCase()+" "+yr.slice(2)+", "+hh+":"+mi+" "+ap+"M";
+};
 
 const SEED_DATA = [
   {unitNo:"CCPRA0002",tower:"A",ownerName:"Mr. VIKRAMADITYA JOSHI",ownerMobile:"9334725476",ownerEmail:"vikram@siddharthshring.com"},
@@ -249,6 +258,7 @@ function App() {
   /* admin */
   const [adminFilter,  setAdminFilter]  = useState({tower:"all",status:"all",q:""});
   const [addFlatForm,  setAddFlatForm]  = useState(emptyFlat());
+  const [pdfFilter,    setPdfFilter]    = useState("All");
 
   useEffect(() => {
     const ref = DB.ref(DB_PATH);
@@ -369,6 +379,89 @@ function App() {
     XLSX.utils.book_append_sheet(wb,ws,"Resident Directory");
     XLSX.writeFile(wb,`RCCP_Directory_${new Date().toISOString().slice(0,10)}.xlsx`);
     notify("Excel downloaded!");
+  };
+
+  /* PDF status report — no contact details */
+  const exportPdfReport = () => {
+    const f = pdfFilter;
+    const sel = records
+      .filter(r => f==="All" || (r.status||"Pending")===f)
+      .sort((a,b)=> (a.tower||"").localeCompare(b.tower||"") || (a.unitNo||"").localeCompare(b.unitNo||""));
+    if(!sel.length){ notify("No records for this filter","error"); return; }
+    const cP=records.filter(r=>(r.status||"Pending")==="Pending").length;
+    const cC=records.filter(r=>r.status==="Confirmed").length;
+    const cU=records.filter(r=>r.status==="Updated").length;
+    const resp=cC+cU, pct=records.length?Math.round(resp/records.length*100):0;
+    const esc=s=>String(s==null?"":s).replace(/[&<>]/g,x=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[x]));
+    const pill=s=>`<span class="pill p-${(s||"Pending").toLowerCase()}">${esc(s||"Pending")}</span>`;
+    const towerBlock = tw => {
+      const sub = sel.filter(r=>r.tower===tw);
+      if(!sub.length) return "";
+      return `<h3>Tower ${tw} &mdash; ${sub.length} flats</h3>
+      <table><thead><tr><th class="c w1">#</th><th class="c w2">Flat No.</th><th class="c w3">Tower</th>
+      <th>Owner Name</th><th class="c w5">Status</th><th class="c w6">Locked</th><th class="w7">Last Updated</th></tr></thead>
+      <tbody>${sub.map((r,i)=>`<tr>
+        <td class="c">${i+1}</td><td class="c b">${esc(r.unitNo)}</td><td class="c">${esc(r.tower)}</td>
+        <td>${esc(r.ownerName)||"\u2014"}</td><td class="c">${pill(r.status)}</td>
+        <td class="c">${r.locked?"Yes":"\u2014"}</td><td>${esc(normTs(r.lastUpdated))}</td></tr>`).join("")}</tbody></table>`;
+    };
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>CCPT Directory Status Report (${esc(f)})</title><style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:Arial,Helvetica,sans-serif;color:#1A252F;padding:22px}
+    h1{font-size:17px;text-align:center;margin-bottom:2px}
+    .sub{font-size:11px;color:#555;text-align:center}
+    .rule{border-bottom:2px solid #1A252F;margin:8px 0 10px}
+    h2{font-size:14px;text-align:center;margin-bottom:2px}
+    h3{font-size:12px;margin:16px 0 6px;page-break-after:avoid;break-after:avoid}
+    table{width:100%;border-collapse:collapse;font-size:9.5px;margin-bottom:6px}
+    thead{display:table-header-group}
+    th{background:#1A252F;color:#fff;padding:6px 5px;text-align:left;font-size:9.5px}
+    td{padding:5px;border:1px solid #9AA5AD}
+    th{border:1px solid #9AA5AD}
+    tr{page-break-inside:avoid;break-inside:avoid}
+    tbody tr:nth-child(odd) td{background:#F4F7FA}
+    .c{text-align:center}.b{font-weight:bold}
+    .w1{width:5%}.w2{width:13%}.w3{width:7%}.w5{width:13%}.w6{width:9%}.w7{width:18%}
+    .pill{display:inline-block;padding:2px 7px;border-radius:9px;font-weight:bold;font-size:9px}
+    .p-pending{background:#FEF3C7;color:#92400E}
+    .p-confirmed{background:#D1FAE5;color:#065F46}
+    .p-updated{background:#DBEAFE;color:#1E40AF}
+    .sum{width:100%;border-collapse:collapse;font-size:10.5px;margin:10px 0 8px}
+    .sum th{background:#1A252F;color:#fff;padding:7px;text-align:center}
+    .sum td{padding:7px;text-align:center;font-weight:bold;border:1px solid #9AA5AD}
+    .note{font-size:10px;color:#555;line-height:1.5;margin-bottom:4px}
+    .bar{display:flex;gap:9px;padding:11px 14px;background:#1A252F;position:sticky;top:0;align-items:center;flex-wrap:wrap;margin:-22px -22px 16px}
+    .bar span{color:rgba(255,255,255,.7);font-size:12px;flex:1;min-width:130px}
+    .ab{border:none;border-radius:7px;padding:9px 16px;font-size:13px;font-weight:bold;cursor:pointer}
+    .pb{background:#B8860B;color:#fff}.sb{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3)}
+    @page{size:A4;margin:12mm 10mm}
+    @media print{.bar{display:none!important}body{padding:0}}
+    </style></head><body>
+    <div class="bar"><span>CCPT Directory &mdash; ${esc(f)}</span>
+      <button class="ab pb" onclick="window.print()">Save as PDF</button>
+      <button class="ab sb" onclick="window.close()">Close</button></div>
+    <h1>CCPT Awasiya Parisar Sanrakshan Association</h1>
+    <div class="sub">The Residency Apartment, City Centre, Patna</div>
+    <div class="rule"></div>
+    <h2>RESIDENT DIRECTORY &mdash; STATUS REPORT</h2>
+    <div class="sub">Filter applied: <b>${esc(f)}</b> &nbsp;|&nbsp; ${sel.length} of ${records.length} flats</div>
+    <table class="sum"><thead><tr><th>Total Flats</th><th>Pending</th><th>Confirmed</th><th>Updated</th><th>Responded</th></tr></thead>
+    <tbody><tr><td>${records.length}</td><td style="background:#FEF3C7">${cP}</td>
+    <td style="background:#D1FAE5">${cC}</td><td style="background:#DBEAFE">${cU}</td>
+    <td style="background:#E5E7EB">${resp} (${pct}%)</td></tr></tbody></table>
+    <div class="note">Contact details (mobile / email) are intentionally excluded from this report.
+    Residents can review and update their own details at <b>residencyccpt.netlify.app</b>.</div>
+    ${towerBlock("A")}${towerBlock("B")}
+    <div style="margin-top:18px;font-size:9px;color:#999;text-align:center;border-top:1px solid #ddd;padding-top:8px">
+    Generated ${esc(tsNow())} &middot; CCPT Resident Directory ${APP_VERSION}</div>
+    </body></html>`;
+    const w = window.open("","_blank");
+    if(!w){ notify("Popup blocked — allow popups and retry","error"); return; }
+    w.document.open(); w.document.write(html); w.document.close();
+    setModal(null);
+    notify("Report opened — tap Save as PDF");
   };
 
   const adminLogin = () => {
@@ -607,6 +700,7 @@ function App() {
               {syncSt==="synced"?"● Live":syncSt==="saving"?"⟳ Saving":"✕ Error"}
             </span>
             <button onClick={()=>setModal("addFlat")} className="btn-gold px-3 py-1.5 rounded-lg text-xs">+ Add Flat</button>
+            <button onClick={()=>setModal("pdfReport")} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold">📄 PDF</button>
             <button onClick={exportExcel} className="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold">📥 Excel</button>
             <button onClick={()=>{setAdminAuth(false);setView("home");}} className="bg-amber-900/40 text-amber-300 px-3 py-1.5 rounded-lg text-xs font-semibold">Logout</button>
           </div>
@@ -725,6 +819,36 @@ function App() {
             {adminRecs.length===0 && <div className="text-center py-12 text-gray-300 text-sm">No records found</div>}
           </div>
         </div>
+
+        {/* PDF Report Modal */}
+        <Modal open={modal==="pdfReport"} onClose={()=>setModal(null)} title="📄 PDF Status Report">
+          <div className="space-y-4">
+            <div>
+              <p className={LBL}>Select Status</p>
+              <div className="space-y-1.5">
+                {[
+                  {k:"All",       l:"All Flats",  n:records.length},
+                  {k:"Pending",   l:"Pending",    n:records.filter(r=>(r.status||"Pending")==="Pending").length},
+                  {k:"Confirmed", l:"Confirmed",  n:records.filter(r=>r.status==="Confirmed").length},
+                  {k:"Updated",   l:"Updated",    n:records.filter(r=>r.status==="Updated").length},
+                ].map(o=>(
+                  <label key={o.k} className={`flex items-center gap-3 cursor-pointer p-2.5 rounded-lg border transition-colors ${pdfFilter===o.k?"border-amber-400 bg-amber-50":"border-amber-100 hover:bg-amber-50"}`}>
+                    <input type="radio" name="pdff" checked={pdfFilter===o.k} onChange={()=>setPdfFilter(o.k)} className="w-4 h-4 accent-amber-700"/>
+                    <span className="text-sm font-semibold text-amber-900 flex-1">{o.l}</span>
+                    <span className="text-xs font-bold text-amber-600">{o.n} flats</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-800">
+              Mobile numbers and email addresses are <b>excluded</b> from this report. It shows Flat No., Tower, Owner Name, Status, Locked and Last Updated.
+            </div>
+            <div className="flex gap-3 pt-2 border-t border-amber-100">
+              <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+              <button onClick={exportPdfReport} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">Generate Report</button>
+            </div>
+          </div>
+        </Modal>
 
         {/* Add Flat Modal */}
         <Modal open={modal==="addFlat"} onClose={()=>setModal(null)} title="➕ Add New Flat" wide>
