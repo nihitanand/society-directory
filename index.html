@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v2.4";
+const APP_VERSION = "v2.5";
 
 const { useState, useEffect } = React;
 
@@ -283,6 +283,9 @@ function App() {
   const [collectForm, setCollectForm] = useState({amount:"",mode:"UPI",date:"",remark:""});
   const [duesPdfType, setDuesPdfType] = useState("All");
   const [duesSort,    setDuesSort]    = useState("out_desc");
+  const [collFrom,    setCollFrom]    = useState("");
+  const [collTo,      setCollTo]      = useState("");
+  const [collScope,   setCollScope]   = useState("all");
   const [moveFrom,    setMoveFrom]    = useState("");
   const [moveTo,      setMoveTo]      = useState("");
 
@@ -674,6 +677,37 @@ function App() {
       .catch(e=>{console.error(e); setSyncSt("error");});
   };
 
+  /* ── collection register for a period (quick entries) ── */
+  const collectionPeriod = React.useMemo(() => {
+    const all = collections.slice().sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+    if(!all.length) return null;
+    const first = all[0].date || "";
+    const last  = all[all.length-1].date || "";
+    const from  = collFrom || first;
+    const to    = collTo   || last;
+    const rows = all.filter(cn => {
+      const d = cn.date || "";
+      if(d < from || d > to) return false;
+      if(collScope==="unreconciled" && cn.reconciled) return false;
+      if(collScope==="reconciled"  && !cn.reconciled) return false;
+      return true;
+    }).map(cn => {
+      const rec = records.find(r=>r.unitNo===cn.unitNo);
+      return {...cn, mobile: rec ? (rec.ownerMobile||"") : "",
+              tower: rec ? rec.tower : (cn.unitNo||"").slice(4,5)};
+    });
+    const total = rows.reduce((s,r)=>s+Number(r.amount||0),0);
+    const byMode = {}, byDay = {}, byTower = {};
+    rows.forEach(r=>{
+      const a=Number(r.amount||0);
+      byMode[r.mode||"Other"] = (byMode[r.mode||"Other"]||0)+a;
+      byDay[r.date||"—"]      = (byDay[r.date||"—"]||0)+a;
+      byTower[r.tower||"—"]   = (byTower[r.tower||"—"]||0)+a;
+    });
+    return {from, to, first, last, rows, total, byMode, byDay, byTower,
+            flats: new Set(rows.map(r=>r.unitNo)).size};
+  }, [collections, records, collFrom, collTo, collScope]);
+
   /* movement between two dates (combined across both towers) */
   const movement = React.useMemo(() => {
     if(!snapDates.length) return null;
@@ -799,6 +833,134 @@ function App() {
     }
     doc.save("CCPT_Dues_"+ty+"_"+new Date().toISOString().slice(0,10)+".pdf");
     setModal(null); notify("\u2705 Dues PDF downloaded");
+  };
+
+  /* ── Collection Summary PDF (period) ── */
+  const downloadCollectionPdf = () => {
+    const cp = collectionPeriod;
+    if(!cp || !cp.rows.length){ notify("No collections in this period","error"); return; }
+    if(!window.jspdf || !window.jspdf.jsPDF){ notify("PDF library not loaded","error"); return; }
+    const doc=new window.jspdf.jsPDF({orientation:"p",unit:"mm",format:"a4"});
+    const W=doc.internal.pageSize.getWidth(), M=11;
+    const NAVY=[26,37,47], GREY=[85,85,85];
+    let y=15;
+    doc.setFont("helvetica","bold"); doc.setFontSize(13); doc.setTextColor(...NAVY);
+    doc.text("CCPT Awasiya Parisar Sanrakshan Association",W/2,y,{align:"center"}); y+=5;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+    doc.text("The Residency Apartment, City Centre, Patna",W/2,y,{align:"center"}); y+=3;
+    doc.setDrawColor(...NAVY); doc.setLineWidth(0.6); doc.line(M,y,W-M,y); y+=6.5;
+    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor(...NAVY);
+    doc.text("COLLECTION SUMMARY",W/2,y,{align:"center"}); y+=4.6;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+    const scopeL = collScope==="all" ? "All entries"
+                 : collScope==="unreconciled" ? "Pending reconciliation only" : "Reconciled only";
+    doc.text("Period: "+cp.from+"  to  "+cp.to+"   |   "+cp.rows.length+" receipts   |   "+scopeL,W/2,y,{align:"center"}); y+=5;
+
+    doc.autoTable({
+      startY:y,
+      head:[["Receipts","Flats","Total Collected"]],
+      body:[[String(cp.rows.length),String(cp.flats),moneyS(cp.total)]],
+      theme:"grid",
+      styles:{fontSize:9.5,halign:"center",cellPadding:2.4,lineColor:[154,165,173],lineWidth:0.2},
+      headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold"},
+      bodyStyles:{fontStyle:"bold",textColor:NAVY,fillColor:[219,234,254]},
+      margin:{left:M,right:M},
+    });
+    y=doc.lastAutoTable.finalY+6;
+
+    /* mode-wise + tower-wise side by side */
+    const modes=Object.keys(cp.byMode).sort((a,b)=>cp.byMode[b]-cp.byMode[a]);
+    doc.autoTable({
+      startY:y,
+      head:[["Mode","Amount","Share"]],
+      body: modes.map(m=>[m,moneyS(cp.byMode[m]),Math.round(cp.byMode[m]/cp.total*100)+"%"]),
+      theme:"grid", tableWidth:88,
+      styles:{fontSize:8,cellPadding:1.8,lineColor:[154,165,173],lineWidth:0.2},
+      headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:8},
+      columnStyles:{0:{cellWidth:34},1:{cellWidth:34,halign:"right"},2:{cellWidth:20,halign:"center"}},
+      margin:{left:M, right:W/2+1.5},
+    });
+    const yMode=doc.lastAutoTable.finalY;
+    const towers=Object.keys(cp.byTower).sort();
+    doc.autoTable({
+      startY:y,
+      head:[["Tower","Amount","Share"]],
+      body: towers.map(t=>["Tower "+t,moneyS(cp.byTower[t]),Math.round(cp.byTower[t]/cp.total*100)+"%"]),
+      theme:"grid", tableWidth:88,
+      styles:{fontSize:8,cellPadding:1.8,lineColor:[154,165,173],lineWidth:0.2},
+      headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:8},
+      columnStyles:{0:{cellWidth:34},1:{cellWidth:34,halign:"right"},2:{cellWidth:20,halign:"center"}},
+      margin:{left:W/2+1.5, right:M},
+    });
+    y=Math.max(yMode,doc.lastAutoTable.finalY)+6;
+
+    /* day-wise */
+    const days=Object.keys(cp.byDay).sort();
+    if(days.length>1){
+      if(y>doc.internal.pageSize.getHeight()-45){ doc.addPage(); y=15; }
+      doc.setFont("helvetica","bold"); doc.setFontSize(10); doc.setTextColor(...NAVY);
+      doc.text("Day-wise Collection",M,y); y+=1.5;
+      doc.autoTable({
+        startY:y+1,
+        head:[["Date","Receipts","Amount"]],
+        body: days.map(d=>[d,String(cp.rows.filter(r=>r.date===d).length),moneyS(cp.byDay[d])]),
+        foot:[["Total",String(cp.rows.length),moneyS(cp.total)]],
+        theme:"grid",
+        styles:{fontSize:8,cellPadding:1.8,lineColor:[154,165,173],lineWidth:0.2},
+        headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:8},
+        footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold"},
+        alternateRowStyles:{fillColor:[244,247,250]},
+        columnStyles:{0:{cellWidth:40},1:{cellWidth:30,halign:"center"},2:{cellWidth:45,halign:"right"}},
+        margin:{left:M,right:M},
+      });
+      y=doc.lastAutoTable.finalY+7;
+    }
+
+    /* receipt register */
+    if(y>doc.internal.pageSize.getHeight()-45){ doc.addPage(); y=15; }
+    doc.setFont("helvetica","bold"); doc.setFontSize(10); doc.setTextColor(...NAVY);
+    doc.text("Receipt Register \u2014 "+cp.rows.length+" entries",M,y); y+=1.5;
+    doc.autoTable({
+      startY:y+1,
+      head:[["Date","Flat","Owner Name","Mobile","Amount","Mode","Remark","Status"]],
+      body: cp.rows.map(r=>[r.date||"\u2014", r.flat||"\u2014", r.name||"\u2014", r.mobile||"\u2014",
+                            moneyS(r.amount), r.mode||"\u2014", r.remark||"\u2014",
+                            r.reconciled?"Reconciled":"Pending"]),
+      foot:[["","","","Total",moneyS(cp.total),"","",""]],
+      theme:"grid",
+      styles:{fontSize:7.2,cellPadding:1.5,valign:"middle",lineColor:[154,165,173],lineWidth:0.2,overflow:"linebreak"},
+      headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:7.2},
+      footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold",fontSize:7.2},
+      alternateRowStyles:{fillColor:[244,247,250]},
+      columnStyles:{0:{cellWidth:19,halign:"center"},1:{cellWidth:15,halign:"center",fontStyle:"bold"},
+        2:{cellWidth:38},3:{cellWidth:22,halign:"center"},4:{cellWidth:23,halign:"right",fontStyle:"bold"},
+        5:{cellWidth:18,halign:"center"},6:{cellWidth:28},7:{cellWidth:22,halign:"center"}},
+      margin:{left:M,right:M},
+      didParseCell:d=>{ if(d.section==="body"&&d.column.index===7){
+        if(d.cell.raw==="Pending"){d.cell.styles.fillColor=[254,243,199];d.cell.styles.textColor=[146,64,14];}
+        else {d.cell.styles.fillColor=[209,250,229];d.cell.styles.textColor=[6,95,70];} } }
+    });
+
+    const pend=cp.rows.filter(r=>!r.reconciled).length;
+    if(pend){
+      let yy=doc.lastAutoTable.finalY+5;
+      if(yy>doc.internal.pageSize.getHeight()-20){ doc.addPage(); yy=15; }
+      doc.setFontSize(7.8); doc.setTextColor(...GREY);
+      doc.text(doc.splitTextToSize(
+        pend+" of these receipts are the committee's own record and have not yet been reconciled against Tally. "+
+        "They will be marked reconciled when the next dues PDF is uploaded.", W-2*M), M, yy);
+    }
+
+    const pages=doc.internal.getNumberOfPages();
+    for(let i=1;i<=pages;i++){ doc.setPage(i);
+      const H=doc.internal.pageSize.getHeight();
+      doc.setDrawColor(204,204,204); doc.setLineWidth(0.2); doc.line(M,H-11,W-M,H-11);
+      doc.setFont("helvetica","normal"); doc.setFontSize(7.2); doc.setTextColor(...GREY);
+      doc.text("CCPT Collection Summary "+cp.from+" to "+cp.to+" \u2014 CONFIDENTIAL",M,H-7);
+      doc.text("Page "+i+" of "+pages,W-M,H-7,{align:"right"});
+    }
+    doc.save("CCPT_Collection_"+cp.from+"_to_"+cp.to+".pdf");
+    setModal(null); notify("\u2705 Collection summary downloaded");
   };
 
   /* ── Collection movement PDF ── */
@@ -1619,6 +1781,17 @@ function App() {
               </button>
             </div>
 
+            <div className="bg-white rounded-2xl border border-purple-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">🧾</div>
+              <h3 className="font-bold text-amber-900 mb-1">Collection Summary (Period)</h3>
+              <p className="text-xs text-gray-500 mb-1">Receipt register for a date range, with mode-wise, tower-wise and day-wise totals.</p>
+              <p className="text-xs text-red-700 font-semibold mb-4">⚠ Confidential — contains mobile numbers</p>
+              <button onClick={()=>setModal("collSummary")} disabled={!collections.length}
+                className="btn-gold w-full py-2.5 rounded-xl text-sm disabled:opacity-40">
+                {collections.length?"Generate":"No collections yet"}
+              </button>
+            </div>
+
             <div className="bg-white rounded-2xl border border-emerald-100 shadow-sm p-5">
               <div className="text-2xl mb-2">📊</div>
               <h3 className="font-bold text-amber-900 mb-1">Full Directory Export</h3>
@@ -1827,6 +2000,72 @@ function App() {
             <div className="flex gap-3 pt-2 border-t border-amber-100">
               <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
               <button onClick={downloadDuesPdf} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">📥 Download</button>
+            </div>
+          </div>
+        </Modal>
+
+        {/* Collection Summary Modal */}
+        <Modal open={modal==="collSummary"} onClose={()=>setModal(null)} title="🧾 Collection Summary">
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-3">
+              <Fld label="From Date">
+                <input type="date" value={collFrom || (collectionPeriod?collectionPeriod.first:"")}
+                  onChange={e=>setCollFrom(e.target.value)} className={INP}/>
+              </Fld>
+              <Fld label="To Date">
+                <input type="date" value={collTo || (collectionPeriod?collectionPeriod.last:"")}
+                  onChange={e=>setCollTo(e.target.value)} className={INP}/>
+              </Fld>
+            </div>
+
+            <div className="flex gap-2 flex-wrap">
+              {[["This month",()=>{const d=new Date();setCollFrom(new Date(d.getFullYear(),d.getMonth(),1).toISOString().slice(0,10));setCollTo(new Date().toISOString().slice(0,10));}],
+                ["Last 7 days",()=>{const d=new Date();d.setDate(d.getDate()-6);setCollFrom(d.toISOString().slice(0,10));setCollTo(new Date().toISOString().slice(0,10));}],
+                ["All time",()=>{setCollFrom("");setCollTo("");}]].map(([l,fn])=>(
+                <button key={l} onClick={fn}
+                  className="text-xs bg-amber-50 text-amber-800 border border-amber-200 px-3 py-1.5 rounded-lg font-semibold hover:bg-amber-100">{l}</button>
+              ))}
+            </div>
+
+            <Fld label="Include">
+              <select value={collScope} onChange={e=>setCollScope(e.target.value)} className={INP}>
+                <option value="all">All entries</option>
+                <option value="unreconciled">Pending reconciliation only</option>
+                <option value="reconciled">Reconciled only</option>
+              </select>
+            </Fld>
+
+            {collectionPeriod && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                <div className="grid grid-cols-3 gap-3 text-center mb-3">
+                  <div><div className="text-xs text-gray-400 font-bold uppercase">Receipts</div>
+                    <div className="font-black text-sm text-amber-900">{collectionPeriod.rows.length}</div></div>
+                  <div><div className="text-xs text-gray-400 font-bold uppercase">Flats</div>
+                    <div className="font-black text-sm text-amber-900">{collectionPeriod.flats}</div></div>
+                  <div><div className="text-xs text-gray-400 font-bold uppercase">Collected</div>
+                    <div className="font-black text-sm text-emerald-700">{money(collectionPeriod.total)}</div></div>
+                </div>
+                {collectionPeriod.rows.length>0 && (
+                  <div className="border-t border-amber-200 pt-2 space-y-1">
+                    {Object.keys(collectionPeriod.byMode).sort((a,b)=>collectionPeriod.byMode[b]-collectionPeriod.byMode[a]).map(m=>(
+                      <div key={m} className="flex justify-between text-xs">
+                        <span className="text-gray-600 font-semibold">{m}</span>
+                        <span className="font-bold text-amber-900">{money(collectionPeriod.byMode[m])}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {collectionPeriod && collectionPeriod.rows.length===0 && (
+              <p className="text-sm text-gray-400 text-center py-2">No receipts in this period.</p>
+            )}
+
+            <div className="flex gap-3 pt-2 border-t border-amber-100">
+              <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+              <button onClick={downloadCollectionPdf} disabled={!collectionPeriod||!collectionPeriod.rows.length}
+                className="btn-gold flex-1 py-2.5 rounded-xl text-sm disabled:opacity-40">📥 Download</button>
             </div>
           </div>
         </Modal>
