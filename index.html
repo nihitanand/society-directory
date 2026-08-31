@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v2.0";
+const APP_VERSION = "v2.1";
 
 const { useState, useEffect } = React;
 
@@ -282,6 +282,7 @@ function App() {
   const [collectRow,  setCollectRow]  = useState(null);
   const [collectForm, setCollectForm] = useState({amount:"",mode:"UPI",date:"",remark:""});
   const [duesPdfType, setDuesPdfType] = useState("All");
+  const [duesSort,    setDuesSort]    = useState("out_desc");
   const [moveFrom,    setMoveFrom]    = useState("");
   const [moveTo,      setMoveTo]      = useState("");
 
@@ -471,6 +472,16 @@ function App() {
     outstanding: a.outstanding + (r.outstanding>0 ? r.outstanding : 0),
   }), {debit:0,credit:0,collected:0,outstanding:0});
 
+  const SORTS = {
+    out_desc:  {l:"Outstanding \u2014 High to Low", f:(a,b)=> b.outstanding-a.outstanding},
+    out_asc:   {l:"Outstanding \u2014 Low to High", f:(a,b)=> a.outstanding-b.outstanding},
+    flat_asc:  {l:"Flat No. \u2014 A to Z",         f:(a,b)=> a.unitNo.localeCompare(b.unitNo)},
+    flat_desc: {l:"Flat No. \u2014 Z to A",         f:(a,b)=> b.unitNo.localeCompare(a.unitNo)},
+    name_asc:  {l:"Owner Name \u2014 A to Z",       f:(a,b)=> (a.name||"").localeCompare(b.name||"")},
+    coll_desc: {l:"Collected \u2014 High to Low",   f:(a,b)=> b.collected-a.collected},
+  };
+  const sortFn = (SORTS[duesSort] || SORTS.out_desc).f;
+
   const filteredDues = duesRows.filter(r => {
     if(duesFilter.tower!=="all" && r.tower!==duesFilter.tower) return false;
     if(duesFilter.type==="Debit"  && !(r.outstanding>0)) return false;
@@ -480,7 +491,7 @@ function App() {
     const q=(duesFilter.q||"").toLowerCase();
     if(q && !(r.name.toLowerCase().includes(q) || r.flat.toLowerCase().includes(q) || r.unitNo.toLowerCase().includes(q))) return false;
     return true;
-  }).sort((a,b)=> b.outstanding - a.outstanding);
+  }).sort(sortFn);
 
   /* ── PDF PARSER (pdf.js, column-aware) ── */
   const parseDuesPdf = async (file) => {
@@ -667,7 +678,7 @@ function App() {
     const ty = duesPdfType;
     const sel = duesRows.filter(r =>
       ty==="All" ? true : ty==="Debit" ? r.outstanding>0 : ty==="Credit" ? r.opening<0 : r.opening===0
-    ).sort((a,b)=> a.tower.localeCompare(b.tower) || b.outstanding-a.outstanding);
+    ).sort((a,b)=> a.tower.localeCompare(b.tower) || sortFn(a,b));
     if(!sel.length){ notify("No rows for this filter","error"); return; }
 
     const doc = new window.jspdf.jsPDF({orientation:"p",unit:"mm",format:"a4"});
@@ -683,7 +694,9 @@ function App() {
     doc.text("OUTSTANDING DUES REPORT", W/2, y, {align:"center"}); y+=4.6;
     doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
     const asOn = latestSnap ? latestSnap.date : "no snapshot";
-    doc.text("Filter: "+ty+"   |   "+sel.length+" flats   |   Tally as on "+asOn, W/2, y, {align:"center"}); y+=4;
+    doc.text("Filter: "+ty+"   |   "+sel.length+" flats   |   Tally as on "+asOn, W/2, y, {align:"center"}); y+=3.8;
+    doc.setFontSize(7.8);
+    doc.text("Sorted by: "+(SORTS[duesSort]||SORTS.out_desc).l, W/2, y, {align:"center"}); y+=4;
 
     doc.autoTable({
       startY:y,
@@ -1422,6 +1435,10 @@ function App() {
                 <option value="all">All Entries</option><option value="Debit">Debit (Outstanding)</option>
                 <option value="Credit">Credit (Advance)</option><option value="Nil">Nil Dues</option>
               </select>
+              <select value={duesSort} onChange={e=>setDuesSort(e.target.value)}
+                className="px-3 py-2 border border-amber-200 rounded-lg text-sm bg-white focus:outline-none">
+                {Object.keys(SORTS).map(k=><option key={k} value={k}>{SORTS[k].l}</option>)}
+              </select>
               <input type="number" placeholder="Min ₹" value={duesFilter.min}
                 onChange={e=>setDuesFilter(f=>({...f,min:e.target.value}))}
                 className="px-3 py-2 border border-amber-200 rounded-lg text-sm bg-white focus:outline-none w-24"/>
@@ -1738,6 +1755,12 @@ function App() {
                 ))}
               </div>
             </div>
+            <Fld label="Sort Order">
+              <select value={duesSort} onChange={e=>setDuesSort(e.target.value)} className={INP}>
+                {Object.keys(SORTS).map(k=><option key={k} value={k}>{SORTS[k].l}</option>)}
+              </select>
+              <p className="text-xs text-gray-400 mt-1">Rows stay grouped by tower; this sorts within each tower.</p>
+            </Fld>
             <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-800">
               <b>Confidential.</b> This report includes owner mobile numbers. Share only within the committee.
             </div>
