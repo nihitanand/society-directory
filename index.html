@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v2.1";
+const APP_VERSION = "v2.2";
 
 const { useState, useEffect } = React;
 
@@ -1241,19 +1241,19 @@ function App() {
       <div className="min-h-screen" style={{background:"var(--cream)"}}>
         {toast && <Toast {...toast}/>}
 
-        <div style={{background:"linear-gradient(135deg,#1A1410,#3D2B1F)"}} className="border-b border-amber-900/30 px-5 py-4 flex justify-between items-center sticky top-0 z-40">
-          <div className="flex items-center gap-3">
-            <button onClick={()=>setView("home")} className="text-amber-400 hover:text-amber-200 text-sm">← Resident View</button>
-            <span className="text-amber-700">|</span>
-            <span className="playfair text-white font-semibold">Admin Dashboard</span>
+        <div style={{background:"linear-gradient(135deg,#1A1410,#3D2B1F)"}} className="border-b border-amber-900/30 px-4 py-3 flex justify-between items-center gap-2 flex-wrap sticky top-0 z-40">
+          <div className="flex items-center gap-2 min-w-0">
+            <button onClick={()=>setView("home")} className="text-amber-400 hover:text-amber-200 text-sm whitespace-nowrap">←<span className="hidden sm:inline"> Resident View</span></button>
+            <span className="text-amber-700 hidden sm:inline">|</span>
+            <span className="playfair text-white font-semibold whitespace-nowrap">Admin<span className="hidden sm:inline"> Dashboard</span></span>
             {unlockCount>0 && <span className="bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded-full animate-pulse">{unlockCount} unlock{unlockCount>1?"s":""}</span>}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
             <span className={`text-xs px-2 py-1 rounded-full font-semibold hidden sm:inline ${syncSt==="synced"?"bg-emerald-900/50 text-emerald-400":syncSt==="saving"?"bg-amber-900/50 text-amber-400":"bg-red-900/50 text-red-400"}`}>
               {syncSt==="synced"?"● Live":syncSt==="saving"?"⟳ Saving":"✕ Error"}
             </span>
             {adminTab==="directory" && <button onClick={()=>setModal("addFlat")} className="btn-gold px-3 py-1.5 rounded-lg text-xs">+ Add Flat</button>}
-            {adminTab==="dues" && <button onClick={()=>{setParsed(null);setModal("upload");}} className="btn-gold px-3 py-1.5 rounded-lg text-xs">⬆ Upload Dues</button>}
+            {adminTab==="dues" && <button onClick={()=>{setParsed(null);setModal("upload");}} className="btn-gold px-3 py-1.5 rounded-lg text-xs whitespace-nowrap">⬆ Upload</button>}
             <button onClick={()=>{setAdminAuth(false);setView("home");window.location.hash="";}} className="bg-amber-900/40 text-amber-300 px-3 py-1.5 rounded-lg text-xs font-semibold">Logout</button>
           </div>
         </div>
@@ -1411,16 +1411,39 @@ function App() {
               ))}
             </div>
 
-            <div className="bg-white rounded-xl border border-amber-100 shadow-sm px-4 py-2.5 mb-4 flex items-center justify-between flex-wrap gap-2">
-              <span className="text-xs text-gray-500">
-                Tally snapshots: {snapshots.map(s=>s.label).join(" · ")}
-              </span>
-              {liveCollections.length>0 && (
-                <span className="text-xs font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-full">
-                  ⚠ {liveCollections.length} quick entries pending reconciliation
-                </span>
-              )}
+            <div className="bg-white rounded-xl border border-amber-100 shadow-sm px-4 py-3 mb-4 flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">Tally uploaded:</span>
+                {["A","B"].map(tw=>{
+                  const s = snapshots.find(x=>x.tower===tw);
+                  return (
+                    <span key={tw} className={`text-xs font-bold px-2.5 py-1 rounded-full border ${s?"bg-emerald-50 text-emerald-700 border-emerald-200":"bg-red-50 text-red-600 border-red-200"}`}>
+                      {s ? `✓ Tower ${tw} · ${s.date}` : `✕ Tower ${tw} pending`}
+                    </span>
+                  );
+                })}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                {liveCollections.length>0 && (
+                  <span className="text-xs font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-full">
+                    ⚠ {liveCollections.length} pending reconciliation
+                  </span>
+                )}
+                <button onClick={()=>{setParsed(null);setModal("upload");}}
+                  className="btn-gold px-4 py-2 rounded-lg text-xs whitespace-nowrap">⬆ Upload Dues PDF</button>
+              </div>
             </div>
+
+            {!snapshots.find(s=>s.tower==="B") && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-4 text-xs text-amber-800">
+                <b>Tower B not uploaded yet.</b> Figures below cover Tower A only. Upload the Tower B dues PDF for the full picture.
+              </div>
+            )}
+            {!snapshots.find(s=>s.tower==="A") && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-4 text-xs text-amber-800">
+                <b>Tower A not uploaded yet.</b> Figures below cover Tower B only.
+              </div>
+            )}
 
             <div className="flex flex-wrap gap-3 mb-4">
               <input placeholder="Search flat or name…" value={duesFilter.q}
