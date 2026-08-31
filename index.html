@@ -12,6 +12,7 @@
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
   <style>
@@ -56,8 +57,9 @@ const FIREBASE_CONFIG = {
 firebase.initializeApp(FIREBASE_CONFIG);
 const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
+const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v1.3";
+const APP_VERSION = "v2.0";
 
 const { useState, useEffect } = React;
 
@@ -203,6 +205,14 @@ const SEED_DATA = [
   {unitNo:"CCPRB1704",tower:"B",ownerName:"Mr. MANISH KUMAR",ownerMobile:"9431011188",ownerEmail:"manishkr132@gmail.com"},
 ];
 
+const money = n => "\u20B9" + Number(n||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+const moneyS = n => Number(n||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+/* "A-104" / "A-0104" -> "CCPRA0104" */
+const toUnitNo = (raw) => {
+  const m = String(raw||"").trim().toUpperCase().match(/^([AB])\s*-\s*(\d{1,4})$/);
+  if(!m) return null;
+  return "CCPR" + m[1] + m[2].padStart(4,"0");
+};
 const emptyFlat = () => ({
   unitNo:"", tower:"A",
   ownerName:"", ownerMobile:"", ownerWhatsapp:"", ownerEmail:"",
@@ -261,6 +271,41 @@ function App() {
   const [adminFilter,  setAdminFilter]  = useState({tower:"all",status:"all",q:""});
   const [addFlatForm,  setAddFlatForm]  = useState(emptyFlat());
   const [pdfFilter,    setPdfFilter]    = useState("All");
+  const [adminTab,     setAdminTab]     = useState("directory");
+
+  /* dues */
+  const [snapshots,   setSnapshots]   = useState([]);
+  const [collections, setCollections] = useState([]);
+  const [duesFilter,  setDuesFilter]  = useState({tower:"all",type:"all",q:"",min:""});
+  const [parsing,     setParsing]     = useState(false);
+  const [parsed,      setParsed]      = useState(null);
+  const [collectRow,  setCollectRow]  = useState(null);
+  const [collectForm, setCollectForm] = useState({amount:"",mode:"UPI",date:"",remark:""});
+  const [duesPdfType, setDuesPdfType] = useState("All");
+  const [moveFrom,    setMoveFrom]    = useState("");
+  const [moveTo,      setMoveTo]      = useState("");
+
+  /* deep link: #admin opens admin login directly */
+  useEffect(() => {
+    const go = () => {
+      const h = (window.location.hash||"").toLowerCase();
+      if(h==="#admin"||h==="#/admin"){ setView("admin"); }
+    };
+    go();
+    window.addEventListener("hashchange", go);
+    return () => window.removeEventListener("hashchange", go);
+  }, []);
+
+  /* dues listener */
+  useEffect(() => {
+    const ref = DB.ref(DUES_PATH);
+    ref.on("value", snap => {
+      const raw = snap.val() || {};
+      setSnapshots(toArr(raw.snapshots).sort((a,b)=>(b.date||"").localeCompare(a.date||"")));
+      setCollections(toArr(raw.collections));
+    }, e => console.error(e));
+    return () => ref.off();
+  }, []);
 
   useEffect(() => {
     const ref = DB.ref(DB_PATH);
@@ -381,6 +426,385 @@ function App() {
     XLSX.utils.book_append_sheet(wb,ws,"Resident Directory");
     XLSX.writeFile(wb,`RCCP_Directory_${new Date().toISOString().slice(0,10)}.xlsx`);
     notify("Excel downloaded!");
+  };
+
+  /* ══════════ DUES ENGINE ══════════ */
+
+  /* latest snapshot */
+  const latestSnap = snapshots.length ? snapshots[0] : null;
+
+  /* collections not yet absorbed by a newer snapshot */
+  const liveCollections = collections.filter(c => !c.reconciled);
+
+  const collectedFor = (unitNo) =>
+    liveCollections.filter(c => c.unitNo===unitNo).reduce((s,c)=>s+Number(c.amount||0),0);
+
+  /* merged view: every directory flat + its dues position */
+  const duesRows = React.useMemo(() => {
+    const snapMap = {};
+    if(latestSnap) toArr(latestSnap.rows).forEach(r => { snapMap[r.unitNo] = r; });
+    return records.map(rec => {
+      const s = snapMap[rec.unitNo];
+      const debit  = s ? Number(s.debit||0)  : 0;
+      const credit = s ? Number(s.credit||0) : 0;
+      const opening = debit - credit;
+      const collected = collectedFor(rec.unitNo);
+      const outstanding = opening - collected;
+      /* name precedence: confirmed/updated directory wins, else Tally */
+      const dirWins = rec.status==="Confirmed" || rec.status==="Updated";
+      const name = dirWins ? (rec.ownerName||"") : ((s && s.name) || rec.ownerName || "");
+      return {
+        unitNo: rec.unitNo, tower: rec.tower,
+        flat: rec.tower + "-" + rec.unitNo.slice(5),
+        name, nameSource: dirWins ? "Directory" : (s ? "Tally" : "Directory"),
+        mobile: rec.ownerMobile||"", status: rec.status||"Pending",
+        inTally: !!s, debit, credit, opening, collected, outstanding,
+        type: opening > 0 ? "Debit" : (opening < 0 ? "Credit" : "Nil"),
+      };
+    });
+  }, [records, snapshots, collections]);
+
+  const duesTotals = duesRows.reduce((a,r)=>({
+    debit:  a.debit  + (r.opening>0 ? r.opening : 0),
+    credit: a.credit + (r.opening<0 ? -r.opening : 0),
+    collected: a.collected + r.collected,
+    outstanding: a.outstanding + (r.outstanding>0 ? r.outstanding : 0),
+  }), {debit:0,credit:0,collected:0,outstanding:0});
+
+  const filteredDues = duesRows.filter(r => {
+    if(duesFilter.tower!=="all" && r.tower!==duesFilter.tower) return false;
+    if(duesFilter.type==="Debit"  && !(r.outstanding>0)) return false;
+    if(duesFilter.type==="Credit" && !(r.opening<0))     return false;
+    if(duesFilter.type==="Nil"    && !(r.opening===0))   return false;
+    if(duesFilter.min && r.outstanding < Number(duesFilter.min)) return false;
+    const q=(duesFilter.q||"").toLowerCase();
+    if(q && !(r.name.toLowerCase().includes(q) || r.flat.toLowerCase().includes(q) || r.unitNo.toLowerCase().includes(q))) return false;
+    return true;
+  }).sort((a,b)=> b.outstanding - a.outstanding);
+
+  /* ── PDF PARSER (pdf.js, column-aware) ── */
+  const parseDuesPdf = async (file) => {
+    setParsing(true); setParsed(null);
+    try {
+      if(!window.pdfjsLib){ notify("PDF engine not loaded","error"); setParsing(false); return; }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      const buf = await file.arrayBuffer();
+      const pdf = await window.pdfjsLib.getDocument({data:buf}).promise;
+
+      let xDebit=null, xCredit=null, tower=null;
+      const rows=[], warnings=[]; let stated=null;
+
+      for(let p=1; p<=pdf.numPages; p++){
+        const page = await pdf.getPage(p);
+        const tc = await page.getTextContent();
+        /* group items into visual lines by y */
+        const lines = {};
+        tc.items.forEach(it => {
+          const t=(it.str||"").trim(); if(!t) return;
+          const x=it.transform[4], y=Math.round(it.transform[5]);
+          let key=null;
+          for(const k of Object.keys(lines)) if(Math.abs(Number(k)-y)<=2){ key=k; break; }
+          if(key===null) key=String(y);
+          (lines[key]=lines[key]||[]).push({t,x,w:it.width||0});
+        });
+        const ordered = Object.keys(lines)
+          .sort((a,b)=>Number(b)-Number(a))
+          .map(k => lines[k].sort((a,b)=>a.x-b.x));
+
+        ordered.forEach(items => {
+          const text = items.map(i=>i.t).join(" ");
+          if(tower===null){
+            const tm = text.match(/Tower\s*:\s*([AB])/i);
+            if(tm) tower = tm[1].toUpperCase();
+          }
+          /* header row -> capture column centres */
+          const dIt = items.find(i=>/^Debit$/i.test(i.t));
+          const cIt = items.find(i=>/^Credit$/i.test(i.t));
+          if(dIt && cIt){ xDebit = dIt.x + dIt.w/2; xCredit = cIt.x + cIt.w/2; }
+
+          const flat_ = text.replace(/\s+/g,"");
+          if(/grandtotal/i.test(flat_)){
+            const nums=items.filter(i=>/^[\d,]+\.\d{2}$/.test(i.t)).map(i=>Number(i.t.replace(/,/g,"")));
+            if(nums.length>=1) stated={debit:nums[0]||0, credit:nums[1]||0};
+            return;
+          }
+          if(/carriedover|broughtforward/i.test(flat_)) return;
+
+          /* data row: A-0002 (Name) amount */
+          const m = text.match(/^([AB])\s*-\s*(\d{1,4})\s*\(([^)]*)\)?/);
+          if(!m) return;
+          const unitNo = toUnitNo(m[1]+"-"+m[2]);
+          if(!unitNo) return;
+          if(m[2].length!==4) warnings.push(m[1]+"-"+m[2]+" normalised to "+unitNo.slice(4,5)+"-"+unitNo.slice(5));
+          const amts = items.filter(i=>/^[\d,]+\.\d{2}$/.test(i.t));
+          if(!amts.length) return;
+          const a = amts[amts.length-1];
+          const val = Number(a.t.replace(/,/g,""));
+          const centre = a.x + a.w/2;
+          let isCredit;
+          if(xDebit!=null && xCredit!=null){
+            isCredit = Math.abs(centre-xCredit) < Math.abs(centre-xDebit);
+          } else {
+            isCredit = false; warnings.push("Column header not found on page "+p);
+          }
+          rows.push({unitNo, tower:unitNo.slice(4,5), name:(m[3]||"").trim(),
+                     debit: isCredit?0:val, credit: isCredit?val:0});
+        });
+      }
+
+      if(!rows.length){ notify("No dues rows found in this PDF","error"); setParsing(false); return; }
+
+      const sumD = rows.reduce((s,r)=>s+r.debit,0);
+      const sumC = rows.reduce((s,r)=>s+r.credit,0);
+      const ok = stated ? (Math.abs(sumD-stated.debit)<1 && Math.abs(sumC-stated.credit)<1) : null;
+      if(stated && !ok) warnings.push("Parsed totals differ from the PDF's Grand Total \u2014 check the Debit/Credit split.");
+
+      const known = new Set(records.map(r=>r.unitNo));
+      const unknown = rows.filter(r=>!known.has(r.unitNo)).map(r=>r.tower+"-"+r.unitNo.slice(5));
+      if(unknown.length) warnings.push("Not in directory: "+unknown.join(", "));
+
+      setParsed({tower: tower||rows[0].tower, rows, sumD, sumC, stated, ok,
+                 warnings:[...new Set(warnings)], fileName:file.name});
+      setParsing(false);
+    } catch(e){
+      console.error(e); notify("Could not read this PDF","error"); setParsing(false);
+    }
+  };
+
+  /* commit parsed snapshot */
+  const commitSnapshot = () => {
+    if(!parsed) return;
+    const today = new Date().toISOString().slice(0,10);
+    const existing = snapshots.find(s => s.date===today && s.tower===parsed.tower);
+    const snap = {
+      id: existing ? existing.id : uid(),
+      date: today, tower: parsed.tower,
+      label: "Tower "+parsed.tower+" \u2014 "+today,
+      rows: parsed.rows,
+      totals: {debit:parsed.sumD, credit:parsed.sumC},
+      uploadedAt: tsNow(), fileName: parsed.fileName,
+    };
+    const others = snapshots.filter(s => s.id!==snap.id);
+    /* mark prior live collections for this tower as reconciled */
+    const upd = collections.map(cn => {
+      if(cn.reconciled) return cn;
+      const rowHere = parsed.rows.find(r=>r.unitNo===cn.unitNo);
+      return rowHere ? {...cn, reconciled:true, reconciledOn:today, reconciledSnap:snap.id} : cn;
+    });
+    setSyncSt("saving");
+    DB.ref(DUES_PATH).update({snapshots:[snap,...others], collections:upd})
+      .then(()=>{ setSyncSt("synced"); notify("\u2705 Snapshot saved for Tower "+parsed.tower); setParsed(null); setModal(null); })
+      .catch(e=>{console.error(e); setSyncSt("error"); notify("Save failed","error");});
+  };
+
+  /* quick collection */
+  const openCollect = (row, full) => {
+    setCollectRow(row);
+    setCollectForm({
+      amount: full ? String(Math.max(0,row.outstanding).toFixed(2)) : "",
+      mode: "UPI",
+      date: new Date().toISOString().slice(0,10),
+      remark: "",
+    });
+    setModal("collect");
+  };
+
+  const saveCollection = () => {
+    const amt = Number(collectForm.amount);
+    if(!collectRow || !amt || amt<=0){ notify("Enter a valid amount","error"); return; }
+    const entry = {
+      id: uid(), unitNo: collectRow.unitNo, flat: collectRow.flat,
+      name: collectRow.name, amount: amt, mode: collectForm.mode,
+      date: collectForm.date, remark: collectForm.remark||"",
+      reconciled: false, recordedAt: tsNow(),
+      snapshotId: latestSnap ? latestSnap.id : null,
+    };
+    setSyncSt("saving");
+    DB.ref(DUES_PATH+"/collections").set([...collections, entry])
+      .then(()=>{ setSyncSt("synced"); notify("\u2705 "+money(amt)+" recorded for "+collectRow.flat);
+                  setModal(null); setCollectRow(null); })
+      .catch(e=>{console.error(e); setSyncSt("error"); notify("Save failed","error");});
+  };
+
+  const deleteCollection = (id) => {
+    setSyncSt("saving");
+    DB.ref(DUES_PATH+"/collections").set(collections.filter(c=>c.id!==id))
+      .then(()=>{ setSyncSt("synced"); notify("Entry reversed"); })
+      .catch(e=>{console.error(e); setSyncSt("error");});
+  };
+
+  /* movement between two points */
+  const movement = React.useMemo(() => {
+    if(!latestSnap) return null;
+    const from = snapshots.find(s=>s.id===moveFrom) || snapshots[snapshots.length-1];
+    const to   = moveTo==="live" ? null : (snapshots.find(s=>s.id===moveTo) || null);
+    if(!from) return null;
+    const fMap={}; toArr(from.rows).forEach(r=>fMap[r.unitNo]=Number(r.debit||0)-Number(r.credit||0));
+    let tMap={}, provisional=false;
+    if(to){ toArr(to.rows).forEach(r=>tMap[r.unitNo]=Number(r.debit||0)-Number(r.credit||0)); }
+    else {
+      provisional=true;
+      Object.keys(fMap).forEach(u=>{ tMap[u] = fMap[u] - collectedFor(u); });
+    }
+    const units=[...new Set([...Object.keys(fMap),...Object.keys(tMap)])];
+    const rows=units.map(u=>{
+      const rec=records.find(r=>r.unitNo===u);
+      const dr=duesRows.find(r=>r.unitNo===u);
+      const open=fMap[u]||0, close=tMap[u]||0;
+      return {unitNo:u, flat:(rec?rec.tower:u.slice(4,5))+"-"+u.slice(5),
+              name: dr?dr.name:(rec?rec.ownerName:""), mobile: rec?rec.ownerMobile||"":"",
+              opening:open, closing:close, collected:open-close};
+    }).filter(r=>Math.abs(r.collected)>0.005).sort((a,b)=>b.collected-a.collected);
+    const tot=rows.reduce((a,r)=>({opening:a.opening+r.opening,closing:a.closing+r.closing,collected:a.collected+r.collected}),{opening:0,closing:0,collected:0});
+    return {from, to, provisional, rows, tot};
+  }, [snapshots, collections, moveFrom, moveTo, records, duesRows]);
+
+
+  /* ── Dues PDF (includes mobile numbers — admin only) ── */
+  const downloadDuesPdf = () => {
+    if(!window.jspdf || !window.jspdf.jsPDF){ notify("PDF library not loaded","error"); return; }
+    const ty = duesPdfType;
+    const sel = duesRows.filter(r =>
+      ty==="All" ? true : ty==="Debit" ? r.outstanding>0 : ty==="Credit" ? r.opening<0 : r.opening===0
+    ).sort((a,b)=> a.tower.localeCompare(b.tower) || b.outstanding-a.outstanding);
+    if(!sel.length){ notify("No rows for this filter","error"); return; }
+
+    const doc = new window.jspdf.jsPDF({orientation:"p",unit:"mm",format:"a4"});
+    const W=doc.internal.pageSize.getWidth(), M=10;
+    const NAVY=[26,37,47], GREY=[85,85,85];
+    let y=15;
+    doc.setFont("helvetica","bold"); doc.setFontSize(13); doc.setTextColor(...NAVY);
+    doc.text("CCPT Awasiya Parisar Sanrakshan Association", W/2, y, {align:"center"}); y+=5;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+    doc.text("The Residency Apartment, City Centre, Patna", W/2, y, {align:"center"}); y+=3;
+    doc.setDrawColor(...NAVY); doc.setLineWidth(0.6); doc.line(M,y,W-M,y); y+=6.5;
+    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor(...NAVY);
+    doc.text("OUTSTANDING DUES REPORT", W/2, y, {align:"center"}); y+=4.6;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+    const asOn = latestSnap ? latestSnap.date : "no snapshot";
+    doc.text("Filter: "+ty+"   |   "+sel.length+" flats   |   Tally as on "+asOn, W/2, y, {align:"center"}); y+=4;
+
+    doc.autoTable({
+      startY:y,
+      head:[["Total Dues","Advance (Cr)","Collected","Net Outstanding"]],
+      body:[[moneyS(duesTotals.debit),moneyS(duesTotals.credit),
+             moneyS(duesTotals.collected),moneyS(duesTotals.outstanding)]],
+      theme:"grid",
+      styles:{fontSize:9,halign:"center",cellPadding:2.2,lineColor:[154,165,173],lineWidth:0.2},
+      headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold"},
+      bodyStyles:{fontStyle:"bold",textColor:NAVY},
+      margin:{left:M,right:M},
+      didParseCell:d=>{ if(d.section!=="body") return;
+        if(d.column.index===0) d.cell.styles.fillColor=[254,226,226];
+        if(d.column.index===1) d.cell.styles.fillColor=[209,250,229];
+        if(d.column.index===2) d.cell.styles.fillColor=[219,234,254];
+        if(d.column.index===3) d.cell.styles.fillColor=[229,231,235]; }
+    });
+    y=doc.lastAutoTable.finalY+4;
+    if(liveCollections.length){
+      doc.setFontSize(7.8); doc.setTextColor(...GREY);
+      doc.text("Collected includes "+liveCollections.length+" quick entries not yet reconciled against Tally.",M,y);
+      y+=5;
+    }
+
+    ["A","B"].forEach(tw=>{
+      const sub=sel.filter(r=>r.tower===tw); if(!sub.length) return;
+      if(y>doc.internal.pageSize.getHeight()-40){ doc.addPage(); y=15; }
+      doc.setFont("helvetica","bold"); doc.setFontSize(10); doc.setTextColor(...NAVY);
+      doc.text("Tower "+tw+" \u2014 "+sub.length+" flats",M,y); y+=1.5;
+      doc.autoTable({
+        startY:y+1,
+        head:[["Flat","Owner Name","Mobile","Opening","Collected","Outstanding","Type"]],
+        body: sub.map(r=>[r.flat, r.name||"\u2014", r.mobile||"\u2014",
+                          moneyS(Math.abs(r.opening)), r.collected?moneyS(r.collected):"\u2014",
+                          moneyS(Math.abs(r.outstanding)), r.type]),
+        foot:[["","","Total",
+               moneyS(sub.reduce((s,r)=>s+Math.abs(r.opening),0)),
+               moneyS(sub.reduce((s,r)=>s+r.collected,0)),
+               moneyS(sub.reduce((s,r)=>s+Math.abs(r.outstanding),0)),""]],
+        theme:"grid",
+        styles:{fontSize:7.6,cellPadding:1.6,valign:"middle",lineColor:[154,165,173],lineWidth:0.2,overflow:"linebreak"},
+        headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:7.6},
+        footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold",fontSize:7.6},
+        alternateRowStyles:{fillColor:[244,247,250]},
+        columnStyles:{0:{cellWidth:16,halign:"center",fontStyle:"bold"},1:{cellWidth:46},
+          2:{cellWidth:24,halign:"center"},3:{cellWidth:26,halign:"right"},
+          4:{cellWidth:24,halign:"right"},5:{cellWidth:26,halign:"right",fontStyle:"bold"},
+          6:{cellWidth:18,halign:"center"}},
+        margin:{left:M,right:M},
+        didParseCell:d=>{ if(d.section==="body"&&d.column.index===6){
+          const v=d.cell.raw;
+          if(v==="Debit"){d.cell.styles.fillColor=[254,226,226];d.cell.styles.textColor=[153,27,27];}
+          if(v==="Credit"){d.cell.styles.fillColor=[209,250,229];d.cell.styles.textColor=[6,95,70];}
+          if(v==="Nil"){d.cell.styles.textColor=[150,150,150];} } }
+      });
+      y=doc.lastAutoTable.finalY+7;
+    });
+
+    const pages=doc.internal.getNumberOfPages();
+    for(let i=1;i<=pages;i++){ doc.setPage(i);
+      const H=doc.internal.pageSize.getHeight();
+      doc.setDrawColor(204,204,204); doc.setLineWidth(0.2); doc.line(M,H-11,W-M,H-11);
+      doc.setFont("helvetica","normal"); doc.setFontSize(7.2); doc.setTextColor(...GREY);
+      doc.text("CCPT Outstanding Dues ("+ty+") \u2014 CONFIDENTIAL, contains mobile numbers",M,H-7);
+      doc.text("Page "+i+" of "+pages,W-M,H-7,{align:"right"});
+    }
+    doc.save("CCPT_Dues_"+ty+"_"+new Date().toISOString().slice(0,10)+".pdf");
+    setModal(null); notify("\u2705 Dues PDF downloaded");
+  };
+
+  /* ── Collection movement PDF ── */
+  const downloadMovementPdf = () => {
+    if(!movement){ notify("Upload a dues snapshot first","error"); return; }
+    if(!window.jspdf || !window.jspdf.jsPDF){ notify("PDF library not loaded","error"); return; }
+    const mv=movement;
+    const doc=new window.jspdf.jsPDF({orientation:"p",unit:"mm",format:"a4"});
+    const W=doc.internal.pageSize.getWidth(), M=12;
+    const NAVY=[26,37,47], GREY=[85,85,85];
+    let y=15;
+    doc.setFont("helvetica","bold"); doc.setFontSize(13); doc.setTextColor(...NAVY);
+    doc.text("CCPT Awasiya Parisar Sanrakshan Association",W/2,y,{align:"center"}); y+=5;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+    doc.text("The Residency Apartment, City Centre, Patna",W/2,y,{align:"center"}); y+=3;
+    doc.setDrawColor(...NAVY); doc.setLineWidth(0.6); doc.line(M,y,W-M,y); y+=6.5;
+    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor(...NAVY);
+    doc.text("COLLECTION MOVEMENT REPORT",W/2,y,{align:"center"}); y+=4.6;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+    doc.text(mv.from.label+"   \u2192   "+(mv.to?mv.to.label:"Quick entries (live)"),W/2,y,{align:"center"}); y+=5;
+    if(mv.provisional){
+      doc.setFillColor(254,243,199); doc.setDrawColor(217,180,74);
+      doc.roundedRect(M,y,W-2*M,9,1.5,1.5,"FD");
+      doc.setFontSize(8); doc.setTextColor(146,64,14); doc.setFont("helvetica","bold");
+      doc.text("PROVISIONAL \u2014 based on quick collection entries, not yet reconciled against Tally.",W/2,y+5.8,{align:"center"});
+      y+=13;
+    }
+    doc.autoTable({
+      startY:y,
+      head:[["Flat","Owner Name","Mobile","Opening","Collected","Closing"]],
+      body: mv.rows.map(r=>[r.flat,r.name||"\u2014",r.mobile||"\u2014",
+                            moneyS(r.opening),moneyS(r.collected),moneyS(r.closing)]),
+      foot:[["","","Total",moneyS(mv.tot.opening),moneyS(mv.tot.collected),moneyS(mv.tot.closing)]],
+      theme:"grid",
+      styles:{fontSize:7.8,cellPadding:1.7,lineColor:[154,165,173],lineWidth:0.2,overflow:"linebreak"},
+      headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:7.8},
+      footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold"},
+      alternateRowStyles:{fillColor:[244,247,250]},
+      columnStyles:{0:{cellWidth:17,halign:"center",fontStyle:"bold"},1:{cellWidth:52},
+        2:{cellWidth:25,halign:"center"},3:{cellWidth:28,halign:"right"},
+        4:{cellWidth:28,halign:"right",fontStyle:"bold"},5:{cellWidth:28,halign:"right"}},
+      margin:{left:M,right:M},
+    });
+    const pages=doc.internal.getNumberOfPages();
+    for(let i=1;i<=pages;i++){ doc.setPage(i);
+      const H=doc.internal.pageSize.getHeight();
+      doc.setDrawColor(204,204,204); doc.setLineWidth(0.2); doc.line(M,H-11,W-M,H-11);
+      doc.setFont("helvetica","normal"); doc.setFontSize(7.2); doc.setTextColor(...GREY);
+      doc.text("CCPT Collection Movement"+(mv.provisional?" (Provisional)":"")+" \u2014 CONFIDENTIAL",M,H-7);
+      doc.text("Page "+i+" of "+pages,W-M,H-7,{align:"right"});
+    }
+    doc.save("CCPT_Collection_Movement_"+new Date().toISOString().slice(0,10)+".pdf");
+    setModal(null); notify("\u2705 Movement report downloaded");
   };
 
   /* PDF status report — direct file download (jsPDF) */
@@ -815,14 +1239,25 @@ function App() {
             <span className={`text-xs px-2 py-1 rounded-full font-semibold hidden sm:inline ${syncSt==="synced"?"bg-emerald-900/50 text-emerald-400":syncSt==="saving"?"bg-amber-900/50 text-amber-400":"bg-red-900/50 text-red-400"}`}>
               {syncSt==="synced"?"● Live":syncSt==="saving"?"⟳ Saving":"✕ Error"}
             </span>
-            <button onClick={()=>setModal("addFlat")} className="btn-gold px-3 py-1.5 rounded-lg text-xs">+ Add Flat</button>
-            <button onClick={()=>setModal("pdfReport")} className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold">📄 PDF</button>
-            <button onClick={exportExcel} className="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold">📥 Excel</button>
-            <button onClick={()=>{setAdminAuth(false);setView("home");}} className="bg-amber-900/40 text-amber-300 px-3 py-1.5 rounded-lg text-xs font-semibold">Logout</button>
+            {adminTab==="directory" && <button onClick={()=>setModal("addFlat")} className="btn-gold px-3 py-1.5 rounded-lg text-xs">+ Add Flat</button>}
+            {adminTab==="dues" && <button onClick={()=>{setParsed(null);setModal("upload");}} className="btn-gold px-3 py-1.5 rounded-lg text-xs">⬆ Upload Dues</button>}
+            <button onClick={()=>{setAdminAuth(false);setView("home");window.location.hash="";}} className="bg-amber-900/40 text-amber-300 px-3 py-1.5 rounded-lg text-xs font-semibold">Logout</button>
           </div>
         </div>
 
-        <div className="max-w-7xl mx-auto px-4 py-7">
+        {/* Tab bar */}
+        <div className="bg-white border-b border-amber-100 px-4 sticky top-[57px] z-30">
+          <div className="max-w-7xl mx-auto flex gap-1">
+            {[["directory","👥 Directory"],["dues","💰 Dues"],["reports","📄 Reports"]].map(([k,l])=>(
+              <button key={k} onClick={()=>setAdminTab(k)}
+                className={`px-4 py-3 text-sm font-semibold border-b-2 transition-colors ${adminTab===k?"border-amber-600 text-amber-800":"border-transparent text-gray-400 hover:text-amber-700"}`}>
+                {l}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="max-w-7xl mx-auto px-4 py-7" style={{display: adminTab==="directory"?"block":"none"}}>
 
           {/* Stats — 5 cards */}
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-7">
@@ -936,6 +1371,189 @@ function App() {
           </div>
         </div>
 
+        {/* ══════════ DUES TAB ══════════ */}
+        <div className="max-w-7xl mx-auto px-4 py-7" style={{display: adminTab==="dues"?"block":"none"}}>
+
+          {!latestSnap && (
+            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-8 text-center mb-6">
+              <div className="text-4xl mb-3">📄</div>
+              <p className="playfair text-xl text-amber-900 font-semibold mb-1">No dues data yet</p>
+              <p className="text-sm text-amber-700 mb-4">Upload the Tally dues PDF for Tower A and Tower B to begin.</p>
+              <button onClick={()=>{setParsed(null);setModal("upload");}} className="btn-gold px-5 py-2.5 rounded-xl text-sm">⬆ Upload Dues PDF</button>
+            </div>
+          )}
+
+          {latestSnap && (<>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+              {[
+                {l:"Total Dues",     v:duesTotals.debit,       c:"text-red-700",     bg:"bg-red-50 border-red-200"},
+                {l:"Advance (Cr)",   v:duesTotals.credit,      c:"text-emerald-700", bg:"bg-emerald-50 border-emerald-200"},
+                {l:"Collected",      v:duesTotals.collected,   c:"text-blue-700",    bg:"bg-blue-50 border-blue-200"},
+                {l:"Net Outstanding",v:duesTotals.outstanding, c:"text-amber-900",   bg:"bg-amber-50 border-amber-200"},
+              ].map(s=>(
+                <div key={s.l} className={`${s.bg} border rounded-2xl p-4`}>
+                  <div className="text-xs font-bold uppercase tracking-wider text-gray-500 mb-1">{s.l}</div>
+                  <div className={`text-xl font-black ${s.c}`}>{money(s.v)}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="bg-white rounded-xl border border-amber-100 shadow-sm px-4 py-2.5 mb-4 flex items-center justify-between flex-wrap gap-2">
+              <span className="text-xs text-gray-500">
+                Tally snapshots: {snapshots.map(s=>s.label).join(" · ")}
+              </span>
+              {liveCollections.length>0 && (
+                <span className="text-xs font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-full">
+                  ⚠ {liveCollections.length} quick entries pending reconciliation
+                </span>
+              )}
+            </div>
+
+            <div className="flex flex-wrap gap-3 mb-4">
+              <input placeholder="Search flat or name…" value={duesFilter.q}
+                onChange={e=>setDuesFilter(f=>({...f,q:e.target.value}))}
+                className="px-3 py-2 border border-amber-200 rounded-lg text-sm bg-white focus:outline-none flex-1 min-w-[160px]"/>
+              <select value={duesFilter.tower} onChange={e=>setDuesFilter(f=>({...f,tower:e.target.value}))}
+                className="px-3 py-2 border border-amber-200 rounded-lg text-sm bg-white focus:outline-none">
+                <option value="all">All Towers</option><option value="A">Tower A</option><option value="B">Tower B</option>
+              </select>
+              <select value={duesFilter.type} onChange={e=>setDuesFilter(f=>({...f,type:e.target.value}))}
+                className="px-3 py-2 border border-amber-200 rounded-lg text-sm bg-white focus:outline-none">
+                <option value="all">All Entries</option><option value="Debit">Debit (Outstanding)</option>
+                <option value="Credit">Credit (Advance)</option><option value="Nil">Nil Dues</option>
+              </select>
+              <input type="number" placeholder="Min ₹" value={duesFilter.min}
+                onChange={e=>setDuesFilter(f=>({...f,min:e.target.value}))}
+                className="px-3 py-2 border border-amber-200 rounded-lg text-sm bg-white focus:outline-none w-24"/>
+              <span className="text-xs text-gray-400 self-center">{filteredDues.length} flats</span>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-amber-100 shadow-sm overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr style={{background:"linear-gradient(135deg,#1A252F,#3D2B1F)"}}>
+                      {["Flat","Owner Name","Mobile","Opening","Collected","Outstanding","Type","Collect"].map((h,i)=>(
+                        <th key={i} className="px-3 py-3 text-left text-xs font-semibold text-amber-300 uppercase tracking-wider whitespace-nowrap">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-amber-50">
+                    {filteredDues.map(r=>(
+                      <tr key={r.unitNo} className="hover:bg-amber-50/40 transition-colors">
+                        <td className="px-3 py-3 font-bold text-amber-900 whitespace-nowrap">{r.flat}</td>
+                        <td className="px-3 py-3 text-gray-800 max-w-[180px] truncate">
+                          {r.name||"—"}
+                          {r.nameSource==="Tally" && <span className="ml-1 text-[10px] text-gray-400">(T)</span>}
+                        </td>
+                        <td className="px-3 py-3 text-xs text-gray-600 whitespace-nowrap">{r.mobile||"—"}</td>
+                        <td className="px-3 py-3 text-right text-xs text-gray-600 whitespace-nowrap">{r.opening?money(Math.abs(r.opening)):"—"}</td>
+                        <td className="px-3 py-3 text-right text-xs font-semibold text-blue-700 whitespace-nowrap">{r.collected?money(r.collected):"—"}</td>
+                        <td className={`px-3 py-3 text-right text-xs font-black whitespace-nowrap ${r.outstanding>0?"text-red-700":r.outstanding<0?"text-emerald-700":"text-gray-300"}`}>
+                          {r.outstanding?money(Math.abs(r.outstanding)):"—"}
+                        </td>
+                        <td className="px-3 py-3 text-center">
+                          <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${r.type==="Debit"?"status-pending":r.type==="Credit"?"status-confirmed":"bg-gray-100 text-gray-400"}`}>{r.type}</span>
+                        </td>
+                        <td className="px-3 py-3 whitespace-nowrap">
+                          {r.outstanding>0 ? (
+                            <div className="flex gap-1.5">
+                              <button onClick={()=>openCollect(r,true)}
+                                className="text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200 font-bold px-2 py-1 rounded-lg transition-colors">Full</button>
+                              <button onClick={()=>openCollect(r,false)}
+                                className="text-xs bg-amber-100 text-amber-700 hover:bg-amber-200 font-bold px-2 py-1 rounded-lg transition-colors">Part</button>
+                            </div>
+                          ) : <span className="text-xs text-gray-300">—</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {filteredDues.length===0 && <div className="text-center py-12 text-gray-300 text-sm">No flats match this filter</div>}
+            </div>
+
+            {liveCollections.length>0 && (
+              <div className="mt-6 bg-white rounded-2xl border border-amber-100 shadow-sm overflow-hidden">
+                <div className="px-4 py-3 bg-amber-50 border-b border-amber-100 flex justify-between items-center">
+                  <span className="text-sm font-bold text-amber-900">Quick Collection Log — {liveCollections.length} entries</span>
+                  <span className="text-xs text-amber-600">Total {money(liveCollections.reduce((s,c)=>s+Number(c.amount||0),0))}</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-gray-100">
+                      <tr>{["Date","Flat","Name","Amount","Mode","Remark",""].map((h,i)=>(
+                        <th key={i} className="px-3 py-2.5 text-left text-xs font-bold uppercase text-gray-400">{h}</th>))}</tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                      {liveCollections.slice().reverse().map(cn=>(
+                        <tr key={cn.id} className="hover:bg-gray-50">
+                          <td className="px-3 py-2.5 text-xs text-gray-500 whitespace-nowrap">{cn.date}</td>
+                          <td className="px-3 py-2.5 font-bold text-amber-900">{cn.flat}</td>
+                          <td className="px-3 py-2.5 text-xs text-gray-600 max-w-[150px] truncate">{cn.name}</td>
+                          <td className="px-3 py-2.5 font-bold text-emerald-700 whitespace-nowrap">{money(cn.amount)}</td>
+                          <td className="px-3 py-2.5"><span className="px-2 py-0.5 rounded-full text-xs bg-gray-100 text-gray-600">{cn.mode}</span></td>
+                          <td className="px-3 py-2.5 text-xs text-gray-400 max-w-[160px] truncate">{cn.remark||"—"}</td>
+                          <td className="px-3 py-2.5">
+                            <button onClick={()=>deleteCollection(cn.id)} className="text-gray-300 hover:text-red-500 text-xs">↺ Reverse</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </>)}
+        </div>
+
+        {/* ══════════ REPORTS TAB ══════════ */}
+        <div className="max-w-7xl mx-auto px-4 py-7" style={{display: adminTab==="reports"?"block":"none"}}>
+          <h2 className="playfair text-2xl font-bold text-amber-900 mb-1">Reports</h2>
+          <p className="text-sm text-gray-400 mb-6">Generate and download reports for committee use.</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+
+            <div className="bg-white rounded-2xl border border-amber-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">📋</div>
+              <h3 className="font-bold text-amber-900 mb-1">Directory Status Report</h3>
+              <p className="text-xs text-gray-500 mb-1">Flat, owner, status and last updated — filter by Pending, Confirmed or Updated.</p>
+              <p className="text-xs text-emerald-700 font-semibold mb-4">✓ Safe to share — no mobile or email</p>
+              <button onClick={()=>setModal("pdfReport")} className="btn-gold w-full py-2.5 rounded-xl text-sm">Generate</button>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-red-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">💰</div>
+              <h3 className="font-bold text-amber-900 mb-1">Outstanding Dues Report</h3>
+              <p className="text-xs text-gray-500 mb-1">Flat-wise dues with mobile numbers — filter by Debit, Credit or All.</p>
+              <p className="text-xs text-red-700 font-semibold mb-4">⚠ Confidential — contains mobile numbers</p>
+              <button onClick={()=>setModal("duesPdf")} disabled={!latestSnap}
+                className="btn-gold w-full py-2.5 rounded-xl text-sm disabled:opacity-40">
+                {latestSnap?"Generate":"Upload dues first"}
+              </button>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-blue-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">📈</div>
+              <h3 className="font-bold text-amber-900 mb-1">Collection Movement Report</h3>
+              <p className="text-xs text-gray-500 mb-1">Opening → Collected → Closing between two snapshots, or live quick entries.</p>
+              <p className="text-xs text-red-700 font-semibold mb-4">⚠ Confidential — contains mobile numbers</p>
+              <button onClick={()=>setModal("movement")} disabled={!latestSnap}
+                className="btn-gold w-full py-2.5 rounded-xl text-sm disabled:opacity-40">
+                {latestSnap?"Generate":"Upload dues first"}
+              </button>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-emerald-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">📊</div>
+              <h3 className="font-bold text-amber-900 mb-1">Full Directory Export</h3>
+              <p className="text-xs text-gray-500 mb-1">Complete Excel workbook including tenant details and contact information.</p>
+              <p className="text-xs text-red-700 font-semibold mb-4">⚠ Confidential — full contact data</p>
+              <button onClick={exportExcel} className="bg-emerald-700 hover:bg-emerald-600 text-white w-full py-2.5 rounded-xl text-sm font-semibold">Download Excel</button>
+            </div>
+
+          </div>
+        </div>
+
         {/* PDF Report Modal */}
         <Modal open={modal==="pdfReport"} onClose={()=>setModal(null)} title="📄 PDF Status Report">
           <div className="space-y-4">
@@ -963,6 +1581,207 @@ function App() {
               <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
               <button onClick={exportPdfReport} className="flex-1 py-2.5 bg-slate-700 hover:bg-slate-600 text-white rounded-xl text-sm font-semibold">👁️ Preview</button>
               <button onClick={downloadPdfReport} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">📥 Download</button>
+            </div>
+          </div>
+        </Modal>
+
+        {/* Upload Dues Modal */}
+        <Modal open={modal==="upload"} onClose={()=>{setModal(null);setParsed(null);}} title="⬆ Upload Tally Dues PDF" wide>
+          <div className="space-y-4">
+            {!parsed && (
+              <>
+                <div className="border-2 border-dashed border-amber-200 rounded-xl p-6 text-center bg-amber-50/50">
+                  <div className="text-3xl mb-2">📄</div>
+                  <p className="text-sm font-semibold text-amber-900 mb-1">Select the Tower A or Tower B dues PDF</p>
+                  <p className="text-xs text-gray-500 mb-4">Group Summary format exported from Tally</p>
+                  <input type="file" accept="application/pdf" disabled={parsing}
+                    onChange={e=>{ const f=e.target.files && e.target.files[0]; if(f) parseDuesPdf(f); }}
+                    className="text-sm mx-auto block"/>
+                  {parsing && <p className="text-sm text-amber-700 font-semibold mt-3 animate-pulse">⟳ Reading PDF…</p>}
+                </div>
+                <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-800">
+                  Debit and Credit are separated by reading each amount's column position, so advances aren't counted as dues. You'll see a preview before anything is saved.
+                </div>
+              </>
+            )}
+
+            {parsed && (
+              <>
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="font-bold text-amber-900">Tower {parsed.tower}</span>
+                    <span className="text-xs text-gray-500">{parsed.rows.length} rows · {parsed.fileName}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="bg-white rounded-lg p-3 border border-red-100">
+                      <div className="text-xs text-gray-400 font-bold uppercase">Debit (Dues)</div>
+                      <div className="font-black text-red-700">{money(parsed.sumD)}</div>
+                    </div>
+                    <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                      <div className="text-xs text-gray-400 font-bold uppercase">Credit (Advance)</div>
+                      <div className="font-black text-emerald-700">{money(parsed.sumC)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {parsed.stated && (
+                  <div className={`rounded-xl p-3 text-xs font-semibold border ${parsed.ok?"bg-emerald-50 border-emerald-200 text-emerald-800":"bg-red-50 border-red-200 text-red-800"}`}>
+                    {parsed.ok
+                      ? "✓ Totals match the Grand Total printed in the PDF"
+                      : `✕ Mismatch — PDF says Debit ${money(parsed.stated.debit)} / Credit ${money(parsed.stated.credit)}`}
+                  </div>
+                )}
+
+                {parsed.warnings.length>0 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
+                    <div className="text-xs font-bold text-amber-800 mb-1">Notes</div>
+                    <ul className="text-xs text-amber-700 space-y-1">
+                      {parsed.warnings.map((w,i)=><li key={i}>• {w}</li>)}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="max-h-56 overflow-y-auto border border-amber-100 rounded-xl">
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50 sticky top-0">
+                      <tr>{["Flat","Name","Debit","Credit"].map((h,i)=>(
+                        <th key={i} className="px-2.5 py-2 text-left font-bold uppercase text-gray-400">{h}</th>))}</tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                      {parsed.rows.map((r,i)=>(
+                        <tr key={i}>
+                          <td className="px-2.5 py-1.5 font-bold text-amber-900">{r.tower}-{r.unitNo.slice(5)}</td>
+                          <td className="px-2.5 py-1.5 text-gray-600 max-w-[150px] truncate">{r.name}</td>
+                          <td className="px-2.5 py-1.5 text-right text-red-700">{r.debit?moneyS(r.debit):"—"}</td>
+                          <td className="px-2.5 py-1.5 text-right text-emerald-700">{r.credit?moneyS(r.credit):"—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex gap-3 pt-2 border-t border-amber-100">
+                  <button onClick={()=>setParsed(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Back</button>
+                  <button onClick={commitSnapshot} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">Save Snapshot</button>
+                </div>
+              </>
+            )}
+          </div>
+        </Modal>
+
+        {/* Quick Collection Modal */}
+        <Modal open={modal==="collect"} onClose={()=>{setModal(null);setCollectRow(null);}} title="💰 Record Collection">
+          {collectRow && (
+            <div className="space-y-4">
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                <div className="flex justify-between items-start">
+                  <div>
+                    <div className="font-black text-amber-900">{collectRow.flat}</div>
+                    <div className="text-sm text-gray-600">{collectRow.name}</div>
+                    <div className="text-xs text-gray-400 mt-0.5">{collectRow.mobile||"no mobile on file"}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs text-gray-400 font-bold uppercase">Outstanding</div>
+                    <div className="font-black text-red-700">{money(collectRow.outstanding)}</div>
+                  </div>
+                </div>
+              </div>
+              <Fld label="Amount Received (₹)">
+                <input type="number" value={collectForm.amount} autoFocus
+                  onChange={e=>setCollectForm(f=>({...f,amount:e.target.value}))} className={INP}/>
+              </Fld>
+              {Number(collectForm.amount)>collectRow.outstanding && (
+                <p className="text-xs text-amber-700 font-semibold">Amount exceeds outstanding — the balance will show as advance.</p>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <Fld label="Mode">
+                  <select value={collectForm.mode} onChange={e=>setCollectForm(f=>({...f,mode:e.target.value}))} className={INP}>
+                    {["UPI","Cash","Bank Transfer","Cheque","Card","Other"].map(m=><option key={m}>{m}</option>)}
+                  </select>
+                </Fld>
+                <Fld label="Date">
+                  <input type="date" value={collectForm.date} onChange={e=>setCollectForm(f=>({...f,date:e.target.value}))} className={INP}/>
+                </Fld>
+              </div>
+              <Fld label="Remark (optional)">
+                <input value={collectForm.remark} onChange={e=>setCollectForm(f=>({...f,remark:e.target.value}))}
+                  className={INP} placeholder="Receipt no., cheque no., notes…"/>
+              </Fld>
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-800">
+                This is the committee's own record, not a Tally receipt. It will be marked reconciled when the next Tally PDF is uploaded.
+              </div>
+              <div className="flex gap-3 pt-2 border-t border-amber-100">
+                <button onClick={()=>{setModal(null);setCollectRow(null);}} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+                <button onClick={saveCollection} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">Record</button>
+              </div>
+            </div>
+          )}
+        </Modal>
+
+        {/* Dues PDF Modal */}
+        <Modal open={modal==="duesPdf"} onClose={()=>setModal(null)} title="💰 Outstanding Dues Report">
+          <div className="space-y-4">
+            <div>
+              <p className={LBL}>Select Entry Type</p>
+              <div className="space-y-1.5">
+                {[
+                  {k:"All",    l:"All Entries",         n:duesRows.length},
+                  {k:"Debit",  l:"Debit — Outstanding", n:duesRows.filter(r=>r.outstanding>0).length},
+                  {k:"Credit", l:"Credit — Advance",    n:duesRows.filter(r=>r.opening<0).length},
+                  {k:"Nil",    l:"Nil Dues",            n:duesRows.filter(r=>r.opening===0).length},
+                ].map(o=>(
+                  <label key={o.k} className={`flex items-center gap-3 cursor-pointer p-2.5 rounded-lg border transition-colors ${duesPdfType===o.k?"border-amber-400 bg-amber-50":"border-amber-100 hover:bg-amber-50"}`}>
+                    <input type="radio" name="dpf" checked={duesPdfType===o.k} onChange={()=>setDuesPdfType(o.k)} className="w-4 h-4 accent-amber-700"/>
+                    <span className="text-sm font-semibold text-amber-900 flex-1">{o.l}</span>
+                    <span className="text-xs font-bold text-amber-600">{o.n} flats</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-800">
+              <b>Confidential.</b> This report includes owner mobile numbers. Share only within the committee.
+            </div>
+            <div className="flex gap-3 pt-2 border-t border-amber-100">
+              <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+              <button onClick={downloadDuesPdf} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">📥 Download</button>
+            </div>
+          </div>
+        </Modal>
+
+        {/* Movement Modal */}
+        <Modal open={modal==="movement"} onClose={()=>setModal(null)} title="📈 Collection Movement">
+          <div className="space-y-4">
+            <Fld label="From (opening position)">
+              <select value={moveFrom} onChange={e=>setMoveFrom(e.target.value)} className={INP}>
+                <option value="">— earliest snapshot —</option>
+                {snapshots.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}
+              </select>
+            </Fld>
+            <Fld label="To (closing position)">
+              <select value={moveTo} onChange={e=>setMoveTo(e.target.value)} className={INP}>
+                <option value="live">Live — quick entries (provisional)</option>
+                {snapshots.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}
+              </select>
+            </Fld>
+            {movement && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 grid grid-cols-3 gap-3 text-center">
+                <div><div className="text-xs text-gray-400 font-bold uppercase">Opening</div><div className="font-black text-sm text-amber-900">{money(movement.tot.opening)}</div></div>
+                <div><div className="text-xs text-gray-400 font-bold uppercase">Collected</div><div className="font-black text-sm text-emerald-700">{money(movement.tot.collected)}</div></div>
+                <div><div className="text-xs text-gray-400 font-bold uppercase">Closing</div><div className="font-black text-sm text-red-700">{money(movement.tot.closing)}</div></div>
+              </div>
+            )}
+            {movement && movement.provisional && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800">
+                <b>Provisional.</b> Based on quick collection entries, not yet reconciled against Tally. Upload the next dues PDF for a confirmed figure.
+              </div>
+            )}
+            {movement && movement.rows.length===0 && (
+              <p className="text-sm text-gray-400 text-center py-3">No movement between these two points.</p>
+            )}
+            <div className="flex gap-3 pt-2 border-t border-amber-100">
+              <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+              <button onClick={downloadMovementPdf} disabled={!movement||!movement.rows.length}
+                className="btn-gold flex-1 py-2.5 rounded-xl text-sm disabled:opacity-40">📥 Download</button>
             </div>
           </div>
         </Modal>
