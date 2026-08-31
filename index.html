@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v2.2";
+const APP_VERSION = "v2.3";
 
 const { useState, useEffect } = React;
 
@@ -431,8 +431,33 @@ function App() {
 
   /* ══════════ DUES ENGINE ══════════ */
 
-  /* latest snapshot */
-  const latestSnap = snapshots.length ? snapshots[0] : null;
+  /* latest snapshot PER TOWER — snapshots are stored per tower, so a single
+     "most recent" snapshot would silently drop the other tower's figures. */
+  const latestByTower = React.useMemo(() => {
+    const m = {};
+    snapshots.forEach(s => {
+      if(!s || !s.tower) return;
+      if(!m[s.tower] || (s.date||"") > (m[s.tower].date||"")) m[s.tower] = s;
+    });
+    return m;
+  }, [snapshots]);
+  const activeSnaps = Object.keys(latestByTower).sort().map(k=>latestByTower[k]);
+  const latestSnap  = activeSnaps.length ? activeSnaps[0] : null;
+  /* all distinct snapshot dates, newest first — a "position" is a date */
+  const snapDates = [...new Set(snapshots.map(s=>s.date).filter(Boolean))].sort().reverse();
+  const asOnDate  = activeSnaps.length
+    ? activeSnaps.map(s=>s.date).sort().slice(-1)[0] : null;
+  /* combined position across both towers as at a given date */
+  const positionAt = (date) => {
+    const m = {};
+    ["A","B"].forEach(tw => {
+      const cands = snapshots.filter(s=>s.tower===tw && (!date || (s.date||"") <= date))
+                             .sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+      const s = cands[cands.length-1];
+      if(s) toArr(s.rows).forEach(r => { m[r.unitNo] = Number(r.debit||0)-Number(r.credit||0); });
+    });
+    return m;
+  };
 
   /* collections not yet absorbed by a newer snapshot */
   const liveCollections = collections.filter(c => !c.reconciled);
@@ -443,7 +468,7 @@ function App() {
   /* merged view: every directory flat + its dues position */
   const duesRows = React.useMemo(() => {
     const snapMap = {};
-    if(latestSnap) toArr(latestSnap.rows).forEach(r => { snapMap[r.unitNo] = r; });
+    activeSnaps.forEach(sn => toArr(sn.rows).forEach(r => { snapMap[r.unitNo] = r; }));
     return records.map(rec => {
       const s = snapMap[rec.unitNo];
       const debit  = s ? Number(s.debit||0)  : 0;
@@ -645,32 +670,34 @@ function App() {
       .catch(e=>{console.error(e); setSyncSt("error");});
   };
 
-  /* movement between two points */
+  /* movement between two dates (combined across both towers) */
   const movement = React.useMemo(() => {
-    if(!latestSnap) return null;
-    const from = snapshots.find(s=>s.id===moveFrom) || snapshots[snapshots.length-1];
-    const to   = moveTo==="live" ? null : (snapshots.find(s=>s.id===moveTo) || null);
-    if(!from) return null;
-    const fMap={}; toArr(from.rows).forEach(r=>fMap[r.unitNo]=Number(r.debit||0)-Number(r.credit||0));
-    let tMap={}, provisional=false;
-    if(to){ toArr(to.rows).forEach(r=>tMap[r.unitNo]=Number(r.debit||0)-Number(r.credit||0)); }
-    else {
-      provisional=true;
-      Object.keys(fMap).forEach(u=>{ tMap[u] = fMap[u] - collectedFor(u); });
+    if(!snapDates.length) return null;
+    const fromDate = moveFrom || snapDates[snapDates.length-1];
+    const fMap = positionAt(fromDate);
+    let tMap = {}, provisional = false, toLabel = "";
+    if(moveTo === "live" || !moveTo){
+      provisional = true;
+      toLabel = "Live \u2014 quick entries";
+      const base = positionAt(snapDates[0]);
+      Object.keys(base).forEach(u => { tMap[u] = base[u] - collectedFor(u); });
+      Object.keys(fMap).forEach(u => { if(!(u in tMap)) tMap[u] = fMap[u] - collectedFor(u); });
+    } else {
+      toLabel = "Tally as on " + moveTo;
+      tMap = positionAt(moveTo);
     }
     const units=[...new Set([...Object.keys(fMap),...Object.keys(tMap)])];
     const rows=units.map(u=>{
       const rec=records.find(r=>r.unitNo===u);
       const dr=duesRows.find(r=>r.unitNo===u);
-      const open=fMap[u]||0, close=tMap[u]||0;
+      const open=fMap[u]||0, close=(u in tMap)?tMap[u]:open;
       return {unitNo:u, flat:(rec?rec.tower:u.slice(4,5))+"-"+u.slice(5),
               name: dr?dr.name:(rec?rec.ownerName:""), mobile: rec?rec.ownerMobile||"":"",
               opening:open, closing:close, collected:open-close};
     }).filter(r=>Math.abs(r.collected)>0.005).sort((a,b)=>b.collected-a.collected);
     const tot=rows.reduce((a,r)=>({opening:a.opening+r.opening,closing:a.closing+r.closing,collected:a.collected+r.collected}),{opening:0,closing:0,collected:0});
-    return {from, to, provisional, rows, tot};
+    return {fromLabel:"Tally as on "+fromDate, toLabel, provisional, rows, tot};
   }, [snapshots, collections, moveFrom, moveTo, records, duesRows]);
-
 
   /* ── Dues PDF (includes mobile numbers — admin only) ── */
   const downloadDuesPdf = () => {
@@ -693,7 +720,7 @@ function App() {
     doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor(...NAVY);
     doc.text("OUTSTANDING DUES REPORT", W/2, y, {align:"center"}); y+=4.6;
     doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
-    const asOn = latestSnap ? latestSnap.date : "no snapshot";
+    const asOn = asOnDate || "no snapshot";
     doc.text("Filter: "+ty+"   |   "+sel.length+" flats   |   Tally as on "+asOn, W/2, y, {align:"center"}); y+=3.8;
     doc.setFontSize(7.8);
     doc.text("Sorted by: "+(SORTS[duesSort]||SORTS.out_desc).l, W/2, y, {align:"center"}); y+=4;
@@ -784,7 +811,7 @@ function App() {
     doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor(...NAVY);
     doc.text("COLLECTION MOVEMENT REPORT",W/2,y,{align:"center"}); y+=4.6;
     doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
-    doc.text(mv.from.label+"   \u2192   "+(mv.to?mv.to.label:"Quick entries (live)"),W/2,y,{align:"center"}); y+=5;
+    doc.text(mv.fromLabel+"   \u2192   "+mv.toLabel,W/2,y,{align:"center"}); y+=5;
     if(mv.provisional){
       doc.setFillColor(254,243,199); doc.setDrawColor(217,180,74);
       doc.roundedRect(M,y,W-2*M,9,1.5,1.5,"FD");
@@ -1799,15 +1826,16 @@ function App() {
           <div className="space-y-4">
             <Fld label="From (opening position)">
               <select value={moveFrom} onChange={e=>setMoveFrom(e.target.value)} className={INP}>
-                <option value="">— earliest snapshot —</option>
-                {snapshots.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}
+                <option value="">— earliest upload ({snapDates[snapDates.length-1]||"—"}) —</option>
+                {snapDates.map(d=><option key={d} value={d}>Tally as on {d}</option>)}
               </select>
             </Fld>
             <Fld label="To (closing position)">
               <select value={moveTo} onChange={e=>setMoveTo(e.target.value)} className={INP}>
                 <option value="live">Live — quick entries (provisional)</option>
-                {snapshots.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}
+                {snapDates.map(d=><option key={d} value={d}>Tally as on {d}</option>)}
               </select>
+              <p className="text-xs text-gray-400 mt-1">Each date combines Tower A and Tower B.</p>
             </Fld>
             {movement && (
               <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 grid grid-cols-3 gap-3 text-center">
