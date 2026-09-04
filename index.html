@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v2.7";
+const APP_VERSION = "v2.8";
 
 const { useState, useEffect } = React;
 
@@ -474,9 +474,29 @@ function App() {
 
   /* merged view: every directory flat + its dues position */
   const duesRows = React.useMemo(() => {
+    /* AGGREGATE per flat — a Tally file can legitimately carry more than one
+       ledger row for the same flat; overwriting would silently lose money. */
     const snapMap = {};
-    activeSnaps.forEach(sn => toArr(sn.rows).forEach(r => { snapMap[r.unitNo] = r; }));
-    return records.map(rec => {
+    activeSnaps.forEach(sn => toArr(sn.rows).forEach(r => {
+      const cur = snapMap[r.unitNo];
+      if(cur){
+        cur.debit  += Number(r.debit||0);
+        cur.credit += Number(r.credit||0);
+        if(r.name && cur.names.indexOf(r.name)<0) cur.names.push(r.name);
+        cur.ledgers += 1;
+      } else {
+        snapMap[r.unitNo] = {debit:Number(r.debit||0), credit:Number(r.credit||0),
+                             name:r.name||"", names:r.name?[r.name]:[], tower:r.tower, ledgers:1};
+      }
+    }));
+    /* every directory flat, PLUS any Tally flat missing from the directory */
+    const seen = {};
+    records.forEach(r => { seen[r.unitNo]=true; });
+    const extra = Object.keys(snapMap).filter(u => !seen[u]).map(u => ({
+      unitNo:u, tower:snapMap[u].tower || u.slice(4,5),
+      ownerName:"", ownerMobile:"", status:"Pending", notInDirectory:true,
+    }));
+    return records.concat(extra).map(rec => {
       const s = snapMap[rec.unitNo];
       const debit  = s ? Number(s.debit||0)  : 0;
       const credit = s ? Number(s.credit||0) : 0;
@@ -484,13 +504,16 @@ function App() {
       const collected = collectedFor(rec.unitNo);
       const outstanding = opening - collected;
       /* name precedence: confirmed/updated directory wins, else Tally */
-      const dirWins = rec.status==="Confirmed" || rec.status==="Updated";
-      const name = dirWins ? (rec.ownerName||"") : ((s && s.name) || rec.ownerName || "");
+      const dirWins = (rec.status==="Confirmed" || rec.status==="Updated") && !rec.notInDirectory;
+      const tallyName = s ? (s.names.length>1 ? s.names.join(" / ") : s.name) : "";
+      const name = dirWins ? (rec.ownerName||"") : (tallyName || rec.ownerName || "");
       return {
         unitNo: rec.unitNo, tower: rec.tower,
         flat: rec.tower + "-" + rec.unitNo.slice(5),
         name, nameSource: dirWins ? "Directory" : (s ? "Tally" : "Directory"),
         mobile: rec.ownerMobile||"", status: rec.status||"Pending",
+        notInDirectory: !!rec.notInDirectory,
+        ledgers: s ? s.ledgers : 0,
         inTally: !!s, debit, credit, opening, collected, outstanding,
         /* type reflects the CURRENT position, after quick collections */
         type: outstanding > 0.005 ? "Debit"
@@ -609,9 +632,18 @@ function App() {
 
       const known = new Set(records.map(r=>r.unitNo));
       const unknown = rows.filter(r=>!known.has(r.unitNo)).map(r=>r.tower+"-"+r.unitNo.slice(5));
-      if(unknown.length) warnings.push("Not in directory: "+unknown.join(", "));
+      if(unknown.length) warnings.push("Not in directory (will still be counted): "+unknown.join(", "));
 
-      setParsed({tower: tower||rows[0].tower, rows, sumD, sumC, stated, ok,
+      /* duplicate flat numbers — more than one ledger row for the same flat */
+      const cnt = {}; rows.forEach(r => { cnt[r.unitNo]=(cnt[r.unitNo]||0)+1; });
+      const dups = Object.keys(cnt).filter(u=>cnt[u]>1).map(u=>{
+        const rs = rows.filter(r=>r.unitNo===u);
+        return {flat: u.slice(4,5)+"-"+u.slice(5),
+                entries: rs.map(r=>({name:r.name, amt:(r.debit||0)-(r.credit||0)})),
+                total: rs.reduce((s,r)=>s+(r.debit||0)-(r.credit||0),0)};
+      });
+
+      setParsed({tower: tower||rows[0].tower, rows, sumD, sumC, stated, ok, dups,
                  warnings:[...new Set(warnings)], fileName:file.name});
       setParsing(false);
     } catch(e){
@@ -1724,6 +1756,8 @@ function App() {
                         <td className="px-3 py-3 text-gray-800 max-w-[180px] truncate">
                           {r.name||"—"}
                           {r.nameSource==="Tally" && <span className="ml-1 text-[10px] text-gray-400">(T)</span>}
+                          {r.notInDirectory && <span className="ml-1 text-[10px] font-bold text-red-500">not in directory</span>}
+                          {r.ledgers>1 && <span className="ml-1 text-[10px] font-bold text-amber-600">{r.ledgers} ledgers</span>}
                         </td>
                         <td className="px-3 py-3 text-xs text-gray-600 whitespace-nowrap">{r.mobile||"—"}</td>
                         <td className="px-3 py-3 text-right text-xs text-gray-600 whitespace-nowrap">{r.opening?money(Math.abs(r.opening)):"—"}</td>
@@ -1959,6 +1993,32 @@ function App() {
                     {parsed.ok
                       ? "✓ Totals match the Grand Total printed in the PDF"
                       : `✕ Mismatch — PDF says Debit ${money(parsed.stated.debit)} / Credit ${money(parsed.stated.credit)}`}
+                  </div>
+                )}
+
+                {parsed.dups && parsed.dups.length>0 && (
+                  <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-3">
+                    <div className="text-xs font-bold text-amber-900 mb-1">
+                      ⚠ {parsed.dups.length} flat{parsed.dups.length>1?"s have":" has"} more than one ledger row
+                    </div>
+                    <p className="text-xs text-amber-700 mb-2">
+                      Amounts will be <b>added together</b> for the flat. Check the source PDF if this looks wrong.
+                    </p>
+                    <div className="space-y-1.5">
+                      {parsed.dups.map(dp=>(
+                        <div key={dp.flat} className="bg-white rounded-lg border border-amber-200 px-2.5 py-1.5">
+                          <div className="flex justify-between text-xs font-bold text-amber-900">
+                            <span>{dp.flat}</span><span>{money(dp.total)}</span>
+                          </div>
+                          {dp.entries.map((e,i)=>(
+                            <div key={i} className="flex justify-between text-xs text-gray-500">
+                              <span className="truncate max-w-[170px]">{e.name||"—"}</span>
+                              <span>{moneyS(e.amt)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
 
