@@ -1,0 +1,13 @@
+# Always revalidate the app shell so a deploy is picked up immediately.
+# Without this, Safari/Chrome can serve a stale index.html for hours and the
+# app runs old code against live Firebase data — which looks like a data bug.
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
