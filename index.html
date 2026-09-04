@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v2.8";
+const APP_VERSION = "v2.9";
 
 const { useState, useEffect } = React;
 
@@ -282,6 +282,7 @@ function App() {
   const [collectRow,  setCollectRow]  = useState(null);
   const [collectForm, setCollectForm] = useState({amount:"",mode:"UPI",date:"",remark:""});
   const [duesPdfType, setDuesPdfType] = useState("All");
+  const [duesPdfMobile, setDuesPdfMobile] = useState(true);
   const [duesSort,    setDuesSort]    = useState("out_desc");
   const [collFrom,    setCollFrom]    = useState("");
   const [collTo,      setCollTo]      = useState("");
@@ -866,27 +867,39 @@ function App() {
       if(y>doc.internal.pageSize.getHeight()-40){ doc.addPage(); y=15; }
       doc.setFont("helvetica","bold"); doc.setFontSize(10); doc.setTextColor(...NAVY);
       doc.text("Tower "+tw+" \u2014 "+sub.length+" flats",M,y); y+=1.5;
+      const withMob = duesPdfMobile;
+      const headRow = withMob
+        ? ["Flat","Owner Name","Mobile","Opening","Collected","Outstanding","Type"]
+        : ["Flat","Owner Name","Opening","Collected","Outstanding","Type"];
+      const typeCol = withMob ? 6 : 5;
       doc.autoTable({
         startY:y+1,
-        head:[["Flat","Owner Name","Mobile","Opening","Collected","Outstanding","Type"]],
-        body: sub.map(r=>[r.flat, r.name||"\u2014", r.mobile||"\u2014",
-                          moneyS(Math.abs(r.opening)), r.collected?moneyS(r.collected):"\u2014",
-                          moneyS(Math.abs(r.outstanding)), r.type]),
-        foot:[["","","Total",
+        head:[headRow],
+        body: sub.map(r=>{
+          const base=[r.flat, r.name||"\u2014"];
+          if(withMob) base.push(r.mobile||"\u2014");
+          return base.concat([moneyS(Math.abs(r.opening)), r.collected?moneyS(r.collected):"\u2014",
+                              moneyS(Math.abs(r.outstanding)), r.type]);
+        }),
+        foot:[(withMob?["","","Total"]:["","Total"]).concat([
                moneyS(sub.reduce((s,r)=>s+Math.abs(r.opening),0)),
                moneyS(sub.reduce((s,r)=>s+r.collected,0)),
-               moneyS(sub.reduce((s,r)=>s+Math.abs(r.outstanding),0)),""]],
+               moneyS(sub.reduce((s,r)=>s+Math.abs(r.outstanding),0)),""])],
         theme:"grid",
         styles:{fontSize:7.6,cellPadding:1.6,valign:"middle",lineColor:[154,165,173],lineWidth:0.2,overflow:"linebreak"},
         headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:7.6},
         footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold",fontSize:7.6},
         alternateRowStyles:{fillColor:[244,247,250]},
-        columnStyles:{0:{cellWidth:16,halign:"center",fontStyle:"bold"},1:{cellWidth:46},
-          2:{cellWidth:24,halign:"center"},3:{cellWidth:26,halign:"right"},
-          4:{cellWidth:24,halign:"right"},5:{cellWidth:26,halign:"right",fontStyle:"bold"},
-          6:{cellWidth:18,halign:"center"}},
+        columnStyles: withMob
+          ? {0:{cellWidth:16,halign:"center",fontStyle:"bold"},1:{cellWidth:46},
+             2:{cellWidth:24,halign:"center"},3:{cellWidth:26,halign:"right"},
+             4:{cellWidth:24,halign:"right"},5:{cellWidth:26,halign:"right",fontStyle:"bold"},
+             6:{cellWidth:18,halign:"center"}}
+          : {0:{cellWidth:20,halign:"center",fontStyle:"bold"},1:{cellWidth:60},
+             2:{cellWidth:30,halign:"right"},3:{cellWidth:28,halign:"right"},
+             4:{cellWidth:30,halign:"right",fontStyle:"bold"},5:{cellWidth:20,halign:"center"}},
         margin:{left:M,right:M},
-        didParseCell:d=>{ if(d.section==="body"&&d.column.index===6){
+        didParseCell:d=>{ if(d.section==="body"&&d.column.index===typeCol){
           const v=d.cell.raw;
           if(v==="Debit"){d.cell.styles.fillColor=[254,226,226];d.cell.styles.textColor=[153,27,27];}
           if(v==="Credit"){d.cell.styles.fillColor=[209,250,229];d.cell.styles.textColor=[6,95,70];}
@@ -901,10 +914,10 @@ function App() {
       const H=doc.internal.pageSize.getHeight();
       doc.setDrawColor(204,204,204); doc.setLineWidth(0.2); doc.line(M,H-11,W-M,H-11);
       doc.setFont("helvetica","normal"); doc.setFontSize(7.2); doc.setTextColor(...GREY);
-      doc.text("CCPT Outstanding Dues ("+ty+") \u2014 CONFIDENTIAL, contains mobile numbers",M,H-7);
+      doc.text("CCPT Outstanding Dues ("+ty+")"+(duesPdfMobile?" \u2014 CONFIDENTIAL, contains mobile numbers":" \u2014 safe to share with residents"),M,H-7);
       doc.text("Page "+i+" of "+pages,W-M,H-7,{align:"right"});
     }
-    doc.save("CCPT_Dues_"+ty+"_"+new Date().toISOString().slice(0,10)+".pdf");
+    doc.save("CCPT_Dues_"+ty+(duesPdfMobile?"":"_ShareSafe")+"_"+new Date().toISOString().slice(0,10)+".pdf");
     setModal(null); notify("\u2705 Dues PDF downloaded");
   };
 
@@ -1877,8 +1890,8 @@ function App() {
             <div className="bg-white rounded-2xl border border-red-100 shadow-sm p-5">
               <div className="text-2xl mb-2">💰</div>
               <h3 className="font-bold text-amber-900 mb-1">Outstanding Dues Report</h3>
-              <p className="text-xs text-gray-500 mb-1">Flat-wise dues with mobile numbers — filter by Debit, Credit or All.</p>
-              <p className="text-xs text-red-700 font-semibold mb-4">⚠ Confidential — contains mobile numbers</p>
+              <p className="text-xs text-gray-500 mb-1">Flat-wise dues — filter by Debit, Credit or All. Mobile numbers optional.</p>
+              <p className="text-xs text-amber-700 font-semibold mb-4">Toggle mobile numbers off for a share-safe version</p>
               <button onClick={()=>setModal("duesPdf")} disabled={!latestSnap}
                 className="btn-gold w-full py-2.5 rounded-xl text-sm disabled:opacity-40">
                 {latestSnap?"Generate":"Upload dues first"}
@@ -2161,9 +2174,26 @@ function App() {
               </select>
               <p className="text-xs text-gray-400 mt-1">Rows stay grouped by tower; this sorts within each tower.</p>
             </Fld>
-            <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-800">
-              <b>Confidential.</b> This report includes owner mobile numbers. Share only within the committee.
+            <div>
+              <p className={LBL}>Contact Details</p>
+              <label className={`flex items-center gap-3 cursor-pointer p-3 rounded-xl border transition-colors ${duesPdfMobile?"border-red-200 bg-red-50":"border-emerald-200 bg-emerald-50"}`}>
+                <input type="checkbox" checked={duesPdfMobile}
+                  onChange={e=>setDuesPdfMobile(e.target.checked)} className="w-4 h-4 accent-amber-700"/>
+                <span className="text-sm font-semibold text-amber-900 flex-1">Include mobile numbers</span>
+                <span className={`text-xs font-bold ${duesPdfMobile?"text-red-700":"text-emerald-700"}`}>
+                  {duesPdfMobile?"Committee only":"Share-safe"}
+                </span>
+              </label>
             </div>
+            {duesPdfMobile ? (
+              <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-800">
+                <b>Confidential.</b> Includes owner mobile numbers. Share only within the committee — not in the resident group.
+              </div>
+            ) : (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-xs text-emerald-800">
+                <b>Safe to share.</b> Mobile numbers excluded. Flat number, owner name and amounts remain visible, so residents can still find their own position.
+              </div>
+            )}
             <div className="flex gap-3 pt-2 border-t border-amber-100">
               <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
               <button onClick={downloadDuesPdf} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">📥 Download</button>
