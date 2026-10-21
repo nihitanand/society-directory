@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v3.0";
+const APP_VERSION = "v3.1";
 
 const { useState, useEffect } = React;
 
@@ -2300,11 +2300,18 @@ function App() {
         })()}
 
         <div className="text-center mt-10 pt-6 border-t border-amber-100">
-          <button onClick={()=>{setView("admin");if(!adminAuth)setModal("adminLogin");}}
-            className="text-xs text-amber-400 hover:text-amber-700 transition-colors font-medium">
-            🔐 Admin Access
-          </button>
-          <div className="text-xs text-amber-300 mt-3">{APP_VERSION} · The Residency City Center Patna</div>
+          <div className="text-[11px] font-bold text-amber-400 uppercase tracking-[2px] mb-3">Staff &amp; Committee Login</div>
+          <div className="flex justify-center gap-3 flex-wrap">
+            <a href="#calls" onClick={()=>setView("calls")}
+              className="px-4 py-2 rounded-xl border border-amber-200 bg-white text-xs font-bold text-amber-800 hover:bg-amber-50 transition-colors">
+              📞 Dues Calling <span className="font-normal text-amber-500">(staff)</span>
+            </a>
+            <button onClick={()=>{setView("admin");if(!adminAuth)setModal("adminLogin");}}
+              className="px-4 py-2 rounded-xl border border-amber-200 bg-white text-xs font-bold text-amber-800 hover:bg-amber-50 transition-colors">
+              🔐 Admin <span className="font-normal text-amber-500">(committee)</span>
+            </button>
+          </div>
+          <div className="text-xs text-amber-300 mt-4">{APP_VERSION} · The Residency City Center Patna</div>
         </div>
       </div>
 
