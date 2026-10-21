@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v2.9";
+const APP_VERSION = "v3.0";
 
 const { useState, useEffect } = React;
 
@@ -250,6 +250,708 @@ function Modal({open,onClose,title,children,wide}) {
   );
 }
 
+/* ══════════════════════════════════════════════════════════════
+   CALLS MODULE — weekly dues calling, promises, ledger ageing
+══════════════════════════════════════════════════════════════ */
+const CALLS_PATH  = "society/calls/v1";
+const LEDGER_PATH = "society/ledger/v1";
+const CALLS_PIN   = "1234";
+const DEFAULT_CALLERS = ["Pratim","Lokesh"];
+
+const CALL_CODES = [
+  {k:"PTP",  l:"Promised to pay",              tone:"ok",   promise:true},
+  {k:"PART", l:"Partial payment promised",     tone:"ok",   promise:true},
+  {k:"PAID", l:"Paid, awaiting update",        tone:"ok"},
+  {k:"DISP", l:"Disputes amount",              tone:"bad"},
+  {k:"LEDG", l:"Ledger required",              tone:"info"},
+  {k:"CB",   l:"Call back later",              tone:"info"},
+  {k:"OOS",  l:"Out of station",               tone:"info"},
+  {k:"NA",   l:"Not answering",                tone:"warn"},
+  {k:"SO",   l:"Switched off",                 tone:"warn"},
+  {k:"REF",  l:"Refused to pay",               tone:"bad"},
+  {k:"SOLD", l:"Sold / tenant — contact owner", tone:"info"},
+];
+const CODE_MAP = {}; CALL_CODES.forEach(c => { CODE_MAP[c.k] = c; });
+const TONE = {
+  ok:  "bg-emerald-50 text-emerald-800 border-emerald-200",
+  info:"bg-blue-50 text-blue-800 border-blue-200",
+  warn:"bg-amber-50 text-amber-800 border-amber-200",
+  bad: "bg-red-50 text-red-700 border-red-200",
+};
+
+const pad2 = n => String(n).padStart(2,"0");
+const isoLocal = d => d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate());
+const todayISO = () => isoLocal(new Date());
+const addDaysISO = (iso,n) => { const d=new Date(iso+"T00:00:00"); d.setDate(d.getDate()+n); return isoLocal(d); };
+const weekStartISO = iso => { const d=new Date((iso||todayISO())+"T00:00:00"); d.setDate(d.getDate()-((d.getDay()+6)%7)); return isoLocal(d); };
+const fmtD  = iso => iso ? iso.slice(8,10)+"/"+iso.slice(5,7)+"/"+iso.slice(2,4) : "—";
+const fmtDL = iso => { if(!iso) return "—"; const d=new Date(iso+"T00:00:00");
+  return d.toLocaleDateString("en-IN",{day:"numeric",month:"short",year:"numeric"}); };
+const fmtMon = ym => { if(!ym) return ""; const d=new Date(ym+"-01T00:00:00");
+  return d.toLocaleDateString("en-IN",{month:"short",year:"numeric"}); };
+const lsGet = k => { try { return window.localStorage.getItem(k); } catch(e) { return null; } };
+const lsSet = (k,v) => { try { window.localStorage.setItem(k,v); } catch(e) {} };
+const lsDel = k => { try { window.localStorage.removeItem(k); } catch(e) {} };
+const firstMobile = m => String(m||"").split(/[,\/]/)[0].replace(/[^\d+]/g,"").trim();
+const rs = n => "Rs. " + Number(n||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+
+/* ---------- ledger core (validated against Python: 121/121 closings) ---------- */
+const LG_MON={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+const tallyDateISO=(s)=>{const m=/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/.exec(s||""); if(!m) return null;
+  const mo=LG_MON[m[2].toLowerCase()]; if(mo===undefined) return null; return "20"+m[3]+"-"+pad2(mo+1)+"-"+pad2(Number(m[1]));};
+async function parseLedgerPdf(pdf, onProgress){
+  const AMT=/^[\d,]+\.\d{2}$/;
+  const L={}, order=[]; let cur=null, xDr=null, xCr=null;
+  for(let p=1;p<=pdf.numPages;p++){
+    const page=await pdf.getPage(p); const tc=await page.getTextContent();
+    const toks=[];
+    tc.items.forEach(it=>{ const s=it.str||""; if(!s.trim()) return;
+      const x0=it.transform[4], w=it.width||0, y=it.transform[5], n=s.length; let pos=0;
+      s.split(/(\s+)/).forEach(part=>{ if(part && !/^\s+$/.test(part)){ toks.push({t:part,x0:x0+w*pos/n,x1:x0+w*(pos+part.length)/n,y}); } pos+=part.length; });
+    });
+    const lines=[];
+    toks.forEach(tk=>{ let ln=null; for(let i=0;i<lines.length;i++){ if(Math.abs(lines[i].y-tk.y)<=2){ln=lines[i];break;} }
+      if(!ln){ ln={y:tk.y,t:[]}; lines.push(ln);} ln.t.push(tk); });
+    lines.sort((a,b)=>b.y-a.y); lines.forEach(l=>l.t.sort((a,b)=>a.x0-b.x0));
+    let lastDate = cur ? L[cur].lastDate : null;
+    for(const ln of lines){
+      const words=ln.t.map(t=>t.t); const text=words.join(" "); const flat=text.replace(/\s+/g,"").toLowerCase();
+      const lm=/Ledger:\s*([AB])\s*-\s*(\d{1,4})\s*\(([^)\n:]*)/.exec(text);
+      if(lm){ const key=lm[1]+"-"+lm[2].padStart(4,"0")+"|"+lm[3].trim();
+        if(!L[key]){ L[key]={unitNo:"CCPR"+lm[1]+lm[2].padStart(4,"0"),tower:lm[1],name:lm[3].trim(),tx:[],closes:[],lastDate:null}; order.push(key); }
+        if(cur!==key){ cur=key; lastDate=L[cur].lastDate; } continue; }
+      const dH=ln.t.find(t=>t.t==="Debit"), cH=ln.t.find(t=>t.t==="Credit");
+      if(dH&&cH){ xDr=dH.x1; xCr=cH.x1; continue; }
+      if(!cur) continue;
+      if(flat.indexOf("carriedover")>=0||flat.indexOf("broughtforward")>=0) continue;
+      if(ln.t.length && ln.t[0].x0<90){ const iso=tallyDateISO(ln.t[0].t); if(iso) lastDate=iso; }
+      const head=words.slice(0,3); const isTo=head.indexOf("To")>=0, isBy=head.indexOf("By")>=0;
+      if(!(isTo||isBy)) continue;
+      let dr=0, cr=0, side=null, amt=0;
+      ln.t.forEach(t=>{ if(!AMT.test(t.t)||xDr===null) return; const v=Number(t.t.replace(/,/g,""));
+        if(Math.abs(t.x1-xDr)<=15){ dr+=v; side="Dr"; amt=v; } else if(Math.abs(t.x1-xCr)<=15){ cr+=v; side="Cr"; amt=v; } });
+      if(flat.indexOf("closingbalance")>=0||flat.indexOf("openingbalance")>=0){
+        if(side) L[cur].closes.push([lastDate||"", flat.indexOf("closing")>=0?"close":"open", side, amt]); continue; }
+      if(dr===0&&cr===0) continue;
+      let vch="", vno="";
+      for(let i=0;i<words.length;i++){ if(["Sales","Receipt","Journal","Payment","Contra"].indexOf(words[i])>=0){ vch=words[i]; vno=words[i+1]&&!AMT.test(words[i+1])?words[i+1]:""; break; } }
+      L[cur].tx.push([lastDate||"", Math.round(dr*100)/100, Math.round(cr*100)/100, vch, vno]);
+    }
+    if(cur) L[cur].lastDate=lastDate;
+    if(onProgress) onProgress(p, pdf.numPages);
+  }
+  const ledgers=order.map(k=>{ const l=L[k]; delete l.lastDate; return l; });
+  let latest=""; ledgers.forEach(l=>l.tx.forEach(t=>{ if(t[0]>latest) latest=t[0]; }));
+  let ok=0, bad=0, nomark=0; const badList=[];
+  ledgers.forEach(l=>{ const cl=l.closes.filter(c=>c[1]==="close"); if(!cl.length){nomark++;return;}
+    const c=cl[cl.length-1]; const exp=c[2]==="Cr"?c[3]:-c[3];
+    const b=l.tx.filter(t=>t[0]&&t[0]<=c[0]).reduce((s,t)=>s+t[1]-t[2],0);
+    if(Math.abs(b-exp)<0.02) ok++; else { bad++; badList.push(l.tower+"-"+l.unitNo.slice(5)); } });
+  return {ledgers, latest, check:{ok,bad,nomark,badList}};
+}
+function computeAgeing(tx, asof){
+  const mm=s=>Number(s.slice(0,4))*12+Number(s.slice(5,7))-1;
+  const A=mm(asof);
+  const rows=tx.filter(t=>t[0]&&t[0]<=asof).slice().sort((a,b)=>a[0].localeCompare(b[0]));
+  const bal=Math.round(rows.reduce((s,t)=>s+t[1]-t[2],0)*100)/100;
+  let credit=rows.reduce((s,t)=>s+t[2],0);
+  const deb=rows.filter(t=>t[1]>0).map(t=>[t[0],t[1]]);
+  deb.forEach(d=>{ const u=Math.min(d[1],credit); d[1]-=u; credit-=u; });
+  const B={cur:0,b12:0,b35:0,b6:0}; let oldest=null;
+  deb.forEach(d=>{ if(d[1]<=0.005) return; const m=A-mm(d[0]);
+    if(m<=0) B.cur+=d[1]; else if(m<=2) B.b12+=d[1]; else if(m<=5) B.b35+=d[1]; else B.b6+=d[1];
+    if(d[1]>10 && !oldest) oldest=d[0]; });
+  const months = (bal>=10 && oldest) ? (A-mm(oldest)+1) : 0;
+  const r2=v=>Math.round(v*100)/100;
+  return {bal, oldest: (bal>=10&&oldest)?oldest.slice(0,7):"", months, cur:r2(B.cur), b12:r2(B.b12), b35:r2(B.b35), b6:r2(B.b6)};
+}
+/* Firebase-safe ledger: flats keyed by unitNo, tx as arrays */
+const normLedgerFlats = raw => {
+  const out = {};
+  Object.keys(raw||{}).forEach(u => {
+    const f = raw[u] || {};
+    /* index-safe: toArr's filter(Boolean) would drop 0 / "" and shift columns */
+    const tup = t => Array.isArray(t) ? t : (t && typeof t==="object") ? [0,1,2,3,4].map(i => t[i]) : [];
+    const list = v => Array.isArray(v) ? v.filter(x => x!==null && x!==undefined)
+                    : (v && typeof v==="object") ? Object.keys(v).sort((a,b)=>Number(a)-Number(b)).map(k=>v[k]) : [];
+    out[u] = { names: list(f.names).map(String), tx: list(f.tx).map(t => { const a=tup(t);
+      return [String(a[0]||""), Number(a[1]||0), Number(a[2]||0), String(a[3]||""), String(a[4]||"")]; }) };
+  });
+  return out;
+};
+
+/* ---------- promise + flag derivation (shared by app, status page and PDFs) ---------- */
+function promiseStatus(p, bal, today){
+  const red = Number(p.balAtCall||0) - bal;
+  const amt = Number(p.promiseAmt||0);
+  if(bal < 10)                 return {s:"Cleared",       tone:"ok",   done:true};
+  if(amt>0 && red >= amt-1)    return {s:"Kept",          tone:"ok",   done:true};
+  if(red > 1)                  return (p.promiseDate && today > p.promiseDate)
+                                  ? {s:"Partly kept", tone:"warn", done:true}
+                                  : {s:"Part received", tone:"info"};
+  if(p.promiseDate && today > p.promiseDate) return {s:"Broken", tone:"bad", broken:true};
+  return {s:"Due "+fmtD(p.promiseDate), tone:"info", open:true};
+}
+
+function deriveCalls(duesRows, calls, ageMap, today){
+  const wk = weekStartISO(today), wkEnd = addDaysISO(wk,6);
+  const by = {};
+  calls.slice().sort((a,b)=>(a.ts||0)-(b.ts||0)).forEach(c => { (by[c.unitNo]=by[c.unitNo]||[]).push(c); });
+  const out = [];
+  duesRows.forEach(r => {
+    const hist = by[r.unitNo] || [];
+    const bal = Number(r.outstanding||0);
+    if(bal < 10 && !hist.length) return;
+    const last = hist.length ? hist[hist.length-1] : null;
+    const weekCalls = hist.filter(c => c.date>=wk && c.date<=wkEnd);
+    let prom = null;
+    for(let i=hist.length-1;i>=0;i--){ if(hist[i].code==="PTP"||hist[i].code==="PART"){ prom=hist[i]; break; } }
+    const ps = prom ? promiseStatus(prom, bal, today) : null;
+    let streak = 0;
+    for(let i=hist.length-1;i>=0;i--){ if(hist[i].code==="NA"||hist[i].code==="SO") streak++; else break; }
+    const flags = [];
+    if(bal>=10){
+      if(ps && ps.broken)                 flags.push("Broken promise");
+      if(streak>=3)                       flags.push("Visit / letter");
+      if(last && last.code==="DISP")      flags.push("Dispute");
+      if(last && last.code==="LEDG")      flags.push("Ledger required");
+      if(last && last.code==="REF")       flags.push("Refused");
+      if(last && last.code==="SOLD")      flags.push("Contact owner");
+      if(last && last.code==="PAID")      flags.push("Paid claim — verify");
+    }
+    out.push({...r, bal, hist, last, weekCalls, calledThisWeek: weekCalls.length>0,
+              prom, ps, streak, flags, age: ageMap ? ageMap[r.unitNo] : null, active: bal>=10});
+  });
+  return out;
+}
+
+function callStats(rows, calls, from, to, today){
+  const inR = calls.filter(c => c.date>=from && c.date<=to);
+  const flatsCalled = {}; inR.forEach(c => { flatsCalled[c.unitNo]=true; });
+  const byCaller = {}, byCode = {};
+  inR.forEach(c => {
+    const k=c.caller||"—"; byCaller[k]=byCaller[k]||{calls:0,flats:{}}; byCaller[k].calls++; byCaller[k].flats[c.unitNo]=true;
+    byCode[c.code]=(byCode[c.code]||0)+1;
+  });
+  const active = rows.filter(r=>r.active);
+  const pending = active.filter(r=>!flatsCalled[r.unitNo]);
+  const promisesMade = inR.filter(c=>c.code==="PTP"||c.code==="PART");
+  const promisedAmt = promisesMade.reduce((s,c)=>s+Number(c.promiseAmt||0),0);
+  const promRows = rows.filter(r=>r.prom && r.prom.date>=from && r.prom.date<=to);
+  const kept = promRows.filter(r=>r.ps && (r.ps.s==="Kept"||r.ps.s==="Cleared"));
+  const partly = promRows.filter(r=>r.ps && (r.ps.s==="Partly kept"||r.ps.s==="Part received"));
+  const broken = rows.filter(r=>r.ps && r.ps.broken && r.active);
+  const dueInRange = rows.filter(r=>r.ps && r.ps.open && r.prom.promiseDate>=from && r.prom.promiseDate<=to);
+  const received = promRows.reduce((s,r)=>s+Math.max(0, Number(r.prom.balAtCall||0)-r.bal),0);
+  return {calls:inR, nCalls:inR.length, nFlats:Object.keys(flatsCalled).length, byCaller, byCode,
+          active, pending, promisesMade, promisedAmt, kept, partly, broken, dueInRange, received,
+          activeAmt: active.reduce((s,r)=>s+r.bal,0)};
+}
+
+/* ---------- per-flat ledger statement PDF ---------- */
+function downloadStatementPdf(flatLabel, names, tx, asof){
+  if(!window.jspdf || !window.jspdf.jsPDF) return false;
+  const doc=new window.jspdf.jsPDF({orientation:"p",unit:"mm",format:"a4"});
+  const W=doc.internal.pageSize.getWidth(), M=12, NAVY=[26,37,47], GREY=[85,85,85];
+  let y=15;
+  doc.setFont("helvetica","bold"); doc.setFontSize(13); doc.setTextColor(...NAVY);
+  doc.text("CCPT Awasiya Parisar Sanrakshan Association",W/2,y,{align:"center"}); y+=5;
+  doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+  doc.text("The Residency Apartment, City Centre, Patna  |  ccptpatna@gmail.com",W/2,y,{align:"center"}); y+=3;
+  doc.setDrawColor(...NAVY); doc.setLineWidth(0.6); doc.line(M,y,W-M,y); y+=6.5;
+  doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor(...NAVY);
+  doc.text("STATEMENT OF ACCOUNT",W/2,y,{align:"center"}); y+=5.5;
+  doc.setFontSize(9.5); doc.text("Flat "+flatLabel+"  —  "+names.join(" / "),W/2,y,{align:"center"}); y+=4.6;
+  doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+  doc.text("Transactions up to "+fmtDL(asof)+", as per Tally ledger",W/2,y,{align:"center"}); y+=4;
+  const rows=tx.filter(t=>t[0]&&t[0]<=asof).slice().sort((a,b)=>a[0].localeCompare(b[0]));
+  let bal=0;
+  const body=rows.map((t,i)=>{ bal+=t[1]-t[2];
+    const part = i===0 && t[3]==="Journal" ? "Opening arrears" :
+                 t[3]==="Sales" ? "Bill "+t[4] : t[3]==="Receipt" ? "Payment received"+(t[4]?" (Rcpt "+t[4]+")":"") :
+                 t[3] ? t[3]+(t[4]?" "+t[4]:"") : (t[2] ? "Adjustment / credit" : "Adjustment / debit");
+    return [fmtD(t[0]), part, t[1]?moneyS(t[1]):"", t[2]?moneyS(t[2]):"", moneyS(Math.abs(bal))+(bal>=0?" Dr":" Cr")]; });
+  const TD=rows.reduce((s,t)=>s+t[1],0), TC=rows.reduce((s,t)=>s+t[2],0);
+  doc.autoTable({startY:y, head:[["Date","Particulars","Debit","Credit","Balance"]], body,
+    foot:[["","Total",moneyS(TD),moneyS(TC),moneyS(Math.abs(bal))+(bal>=0?" Dr":" Cr")]],
+    theme:"grid", styles:{fontSize:7.8,cellPadding:1.6,lineColor:[154,165,173],lineWidth:0.2},
+    headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold"},
+    footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold"},
+    alternateRowStyles:{fillColor:[244,247,250]},
+    columnStyles:{0:{cellWidth:20,halign:"center"},1:{cellWidth:72},2:{cellWidth:28,halign:"right"},
+                  3:{cellWidth:28,halign:"right"},4:{cellWidth:38,halign:"right",fontStyle:"bold"}},
+    margin:{left:M,right:M}});
+  let yy=doc.lastAutoTable.finalY+7;
+  if(yy>doc.internal.pageSize.getHeight()-30){ doc.addPage(); yy=20; }
+  doc.setFont("helvetica","bold"); doc.setFontSize(10.5); doc.setTextColor(...(bal>=0?[153,27,27]:[6,95,70]));
+  doc.text((bal>=0?"Amount due: ":"Advance held: ")+rs(Math.abs(bal)),M,yy); yy+=6;
+  doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+  doc.text("Pay via UPI: ccptpatna@sbi. Payments made after "+fmtDL(asof)+" are not reflected above.",M,yy);
+  const pages=doc.internal.getNumberOfPages();
+  for(let i=1;i<=pages;i++){ doc.setPage(i); const H=doc.internal.pageSize.getHeight();
+    doc.setFontSize(7.2); doc.setTextColor(...GREY);
+    doc.text("CCPT — Statement of account, Flat "+flatLabel,M,H-7);
+    doc.text("Page "+i+" of "+pages,W-M,H-7,{align:"right"}); }
+  doc.save("CCPT_Statement_"+flatLabel+"_"+asof+".pdf");
+  return true;
+}
+
+/* ---------- Calling report PDF ---------- */
+function downloadCallingPdf(rows, calls, from, to, withMobile, withHistory, today, osAsOn, ledgerAsOf){
+  if(!window.jspdf || !window.jspdf.jsPDF) return false;
+  const st = callStats(rows, calls, from, to, today);
+  const doc=new window.jspdf.jsPDF({orientation:"l",unit:"mm",format:"a4"});
+  const W=doc.internal.pageSize.getWidth(), M=11, NAVY=[26,37,47], GREY=[85,85,85];
+  const head = (title) => {
+    let y=13;
+    doc.setFont("helvetica","bold"); doc.setFontSize(13); doc.setTextColor(...NAVY);
+    doc.text("CCPT Awasiya Parisar Sanrakshan Association",W/2,y,{align:"center"}); y+=4.8;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
+    doc.text("The Residency Apartment, City Centre, Patna",W/2,y,{align:"center"}); y+=3;
+    doc.setDrawColor(...NAVY); doc.setLineWidth(0.6); doc.line(M,y,W-M,y); y+=6;
+    doc.setFont("helvetica","bold"); doc.setFontSize(11.5); doc.setTextColor(...NAVY);
+    doc.text(title,W/2,y,{align:"center"}); y+=4.6;
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.3); doc.setTextColor(...GREY);
+    doc.text("Period "+fmtDL(from)+" to "+fmtDL(to)+"   |   Dues as per OS of "+(osAsOn?fmtDL(osAsOn):"—")+
+             (ledgerAsOf?"   |   Ageing per ledger to "+fmtDL(ledgerAsOf):""),W/2,y,{align:"center"});
+    return y+4;
+  };
+  const grid = {theme:"grid", styles:{fontSize:7.8,cellPadding:1.7,valign:"middle",lineColor:[154,165,173],lineWidth:0.2,overflow:"linebreak"},
+    headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:7.8},
+    footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold"},
+    alternateRowStyles:{fillColor:[244,247,250]}, margin:{left:M,right:M}};
+  let y = head("DUES CALLING REPORT");
+
+  doc.autoTable({...grid, startY:y,
+    head:[["Flats with dues","Outstanding","Calls made","Flats called","Not yet called","Promises made","Amount promised","Broken promises"]],
+    body:[[String(st.active.length), moneyS(st.activeAmt), String(st.nCalls), String(st.nFlats), String(st.pending.length),
+           String(st.promisesMade.length), moneyS(st.promisedAmt), String(st.broken.length)]],
+    styles:{...grid.styles, halign:"center", fontSize:8.6, fontStyle:"bold", textColor:NAVY},
+    alternateRowStyles:{}});
+  y = doc.lastAutoTable.finalY + 5;
+
+  const callers = Object.keys(st.byCaller).sort();
+  doc.autoTable({...grid, startY:y, tableWidth:(W-2*M)/2-3,
+    head:[["Caller","Calls","Flats"]],
+    body: callers.length ? callers.map(k=>[k,String(st.byCaller[k].calls),String(Object.keys(st.byCaller[k].flats).length)]) : [["No calls in period","",""]],
+    columnStyles:{1:{halign:"center"},2:{halign:"center"}}, margin:{left:M}});
+  const yA = doc.lastAutoTable.finalY;
+  const codes = CALL_CODES.filter(c=>st.byCode[c.k]);
+  doc.autoTable({...grid, startY:y, tableWidth:(W-2*M)/2-3,
+    head:[["Outcome","Calls","Share"]],
+    body: codes.length ? codes.map(c=>[c.l,String(st.byCode[c.k]),Math.round(st.byCode[c.k]/st.nCalls*100)+"%"]) : [["—","",""]],
+    columnStyles:{1:{halign:"center"},2:{halign:"center"}}, margin:{left:W/2+3}});
+  y = Math.max(yA, doc.lastAutoTable.finalY) + 6;
+
+  /* flat-wise status */
+  const act = rows.filter(r=>r.active || (r.last && r.last.date>=from && r.last.date<=to))
+                  .sort((a,b)=>(b.flags.indexOf("Broken promise")>=0)-(a.flags.indexOf("Broken promise")>=0) || b.bal-a.bal);
+  if(y>doc.internal.pageSize.getHeight()-40){ doc.addPage(); y=14; }
+  doc.setFont("helvetica","bold"); doc.setFontSize(10); doc.setTextColor(...NAVY);
+  doc.text("Flat-wise status — "+act.length+" flats",M,y); y+=1.5;
+  const hdr = ["Flat","Owner"].concat(withMobile?["Mobile"]:[]).concat(["Outstanding","Unpaid since","Last call","Caller","Last outcome","Promise","Promise status","Flags / note"]);
+  const body = act.map(r=>{
+    const lc=r.last;
+    const prom = r.prom ? (fmtD(r.prom.promiseDate)+(r.prom.promiseAmt?" / "+moneyS(r.prom.promiseAmt):"")) : "—";
+    const row=[r.flat, r.name||"—"];
+    if(withMobile) row.push(firstMobile(r.mobile)||"—");
+    return row.concat([ r.active?moneyS(r.bal):"Cleared",
+      r.age && r.age.oldest ? fmtMon(r.age.oldest)+" ("+r.age.months+"m)" : "—",
+      lc?fmtD(lc.date):"Not called", lc?(lc.caller||""):"", lc?CODE_MAP[lc.code].l:"—",
+      prom, r.ps?r.ps.s:"—", (r.flags.join(", ")+(lc&&lc.note?(r.flags.length?" — ":"")+lc.note:""))||"" ]);
+  });
+  const sCol = withMobile ? 9 : 8;
+  doc.autoTable({...grid, startY:y+1, head:[hdr], body,
+    columnStyles: withMobile
+      ? {0:{cellWidth:15,fontStyle:"bold",halign:"center"},1:{cellWidth:40},2:{cellWidth:21},3:{cellWidth:23,halign:"right"},4:{cellWidth:22},5:{cellWidth:16,halign:"center"},6:{cellWidth:15},7:{cellWidth:30},8:{cellWidth:28},9:{cellWidth:20},10:{cellWidth:45}}
+      : {0:{cellWidth:15,fontStyle:"bold",halign:"center"},1:{cellWidth:46},2:{cellWidth:24,halign:"right"},3:{cellWidth:24},4:{cellWidth:17,halign:"center"},5:{cellWidth:16},6:{cellWidth:32},7:{cellWidth:30},8:{cellWidth:22},9:{cellWidth:49}},
+    didParseCell:d=>{ if(d.section!=="body") return;
+      if(d.column.index===sCol){ const v=String(d.cell.raw);
+        if(v==="Broken"){d.cell.styles.fillColor=[254,226,226];d.cell.styles.textColor=[153,27,27];d.cell.styles.fontStyle="bold";}
+        else if(v==="Kept"||v==="Cleared"){d.cell.styles.fillColor=[209,250,229];d.cell.styles.textColor=[6,95,70];}
+        else if(v.indexOf("Due")===0||v.indexOf("Part")===0){d.cell.styles.fillColor=[219,234,254];d.cell.styles.textColor=[30,64,175];} }
+      if(d.column.index===(withMobile?5:4) && d.cell.raw==="Not called"){ d.cell.styles.textColor=[180,83,9]; d.cell.styles.fontStyle="bold"; } }});
+
+  if(withHistory){
+    doc.addPage(); let yh = head("CALL HISTORY — FLAT-WISE");
+    const hRows=[];
+    rows.filter(r=>r.hist.some(c=>c.date>=from&&c.date<=to)).sort((a,b)=>a.unitNo.localeCompare(b.unitNo)).forEach(r=>{
+      r.hist.filter(c=>c.date>=from&&c.date<=to).slice().reverse().forEach((c,i)=>{
+        hRows.push([i===0?r.flat:"", i===0?(r.name||""):"", fmtD(c.date)+" "+(c.time||""), c.caller||"", CODE_MAP[c.code]?CODE_MAP[c.code].l:c.code,
+          c.promiseDate?fmtD(c.promiseDate)+(c.promiseAmt?" / "+moneyS(c.promiseAmt):""):"", moneyS(c.balAtCall||0), c.note||""]); }); });
+    doc.autoTable({...grid, startY:yh, head:[["Flat","Owner","Date / time","Caller","Outcome","Promise","Bal. at call","Note"]],
+      body: hRows.length?hRows:[["","No calls in period","","","","","",""]],
+      columnStyles:{0:{cellWidth:16,fontStyle:"bold",halign:"center"},1:{cellWidth:45},2:{cellWidth:28},3:{cellWidth:20},4:{cellWidth:42},5:{cellWidth:32},6:{cellWidth:26,halign:"right"},7:{cellWidth:66}}});
+  }
+
+  const pages=doc.internal.getNumberOfPages();
+  for(let i=1;i<=pages;i++){ doc.setPage(i); const H=doc.internal.pageSize.getHeight();
+    doc.setDrawColor(204,204,204); doc.setLineWidth(0.2); doc.line(M,H-10,W-M,H-10);
+    doc.setFont("helvetica","normal"); doc.setFontSize(7.2); doc.setTextColor(...GREY);
+    doc.text("CCPT Dues Calling Report "+fmtD(from)+" to "+fmtD(to)+(withMobile?" — CONFIDENTIAL, contains mobile numbers":"")+
+             "   |   Promise status compares balance at the time of the call with the latest OS upload.",M,H-6);
+    doc.text("Page "+i+" of "+pages,W-M,H-6,{align:"right"}); }
+  doc.save("CCPT_Calling_Report_"+from+"_to_"+to+(withMobile?"":"_ShareSafe")+".pdf");
+  return true;
+}
+
+/* ---------- small UI bits ---------- */
+function Chip({tone,children}){ return <span className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-bold border ${TONE[tone]||TONE.info}`}>{children}</span>; }
+
+function AgeLine({age}){
+  if(!age || !age.oldest) return null;
+  return <span className={`text-[11px] font-bold ${age.months>=6?"text-red-700":age.months>=3?"text-amber-700":"text-gray-500"}`}>
+    Unpaid since {fmtMon(age.oldest)} · {age.months}m</span>;
+}
+
+/* ══════════ CALLS MODULE (used by #calls and admin Calls tab) ══════════ */
+function CallsModule({mode, duesRows, calls, callers, ledger, ageMap, notify, onExit, osAsOn}){
+  const today = todayISO();
+  const wk = weekStartISO(today), wkEnd = addDaysISO(wk,6);
+  const [caller, setCaller]   = useState(lsGet("ccpt_caller") || "");
+  const [tab, setTab]         = useState("pending");
+  const [q, setQ]             = useState("");
+  const [tower, setTower]     = useState("all");
+  const [sortBy, setSortBy]   = useState("amt");
+  const [logRow, setLogRow]   = useState(null);
+  const [histRow, setHistRow] = useState(null);
+  const [form, setForm]       = useState({code:"",promiseDate:"",promiseAmt:"",note:""});
+  const [saving, setSaving]   = useState(false);
+  const [newCaller, setNewCaller] = useState("");
+
+  const rows = React.useMemo(() => deriveCalls(duesRows, calls, ageMap, today), [duesRows, calls, ageMap, today]);
+  const active = rows.filter(r=>r.active);
+  const calledWk = active.filter(r=>r.calledThisWeek);
+  const pct = active.length ? Math.round(calledWk.length/active.length*100) : 0;
+
+  const callerNames = callers.length ? callers : DEFAULT_CALLERS;
+  const pickCaller = n => { setCaller(n); lsSet("ccpt_caller", n); };
+
+  const tabRows = (() => {
+    let list;
+    if(tab==="pending")  list = active.filter(r=>!r.calledThisWeek);
+    else if(tab==="called")   list = active.filter(r=>r.calledThisWeek);
+    else if(tab==="promises") list = rows.filter(r=>r.ps && !r.ps.done);
+    else if(tab==="flags")    list = active.filter(r=>r.flags.length);
+    else if(tab==="cleared")  list = rows.filter(r=>!r.active && r.hist.length);
+    else list = rows.slice();
+    if(tower!=="all") list = list.filter(r=>r.tower===tower);
+    const qq = q.trim().toLowerCase();
+    if(qq) list = list.filter(r => (r.flat+" "+r.unitNo+" "+(r.name||"")).toLowerCase().indexOf(qq)>=0);
+    const broken = r => r.flags.indexOf("Broken promise")>=0 ? 1 : 0;
+    list.sort((a,b) => {
+      if(tab==="called") return (b.last?b.last.ts:0)-(a.last?a.last.ts:0);
+      if(tab==="promises") return String(a.prom?a.prom.promiseDate:"").localeCompare(String(b.prom?b.prom.promiseDate:""));
+      if(broken(b)-broken(a)) return broken(b)-broken(a);
+      if(sortBy==="age") return ((b.age&&b.age.months)||0)-((a.age&&a.age.months)||0) || b.bal-a.bal;
+      if(sortBy==="flat") return a.unitNo.localeCompare(b.unitNo);
+      return b.bal-a.bal;
+    });
+    return list;
+  })();
+
+  const openLog = r => {
+    setLogRow(r);
+    setForm({code:"", promiseDate:addDaysISO(today,3), promiseAmt:String(Math.round(r.bal)), note:""});
+  };
+  const saveCall = () => {
+    if(!caller){ notify("Select your name first","error"); return; }
+    if(!form.code){ notify("Pick an outcome","error"); return; }
+    const isProm = CODE_MAP[form.code].promise;
+    if(isProm && !form.promiseDate){ notify("Enter promise date","error"); return; }
+    if(isProm && !(Number(form.promiseAmt)>0)){ notify("Enter promised amount","error"); return; }
+    const now = new Date();
+    const id = "c"+now.getTime().toString(36)+Math.random().toString(36).slice(2,6);
+    const rec = {id, unitNo:logRow.unitNo, flat:logRow.flat, name:logRow.name||"",
+      date:isoLocal(now), time:pad2(now.getHours())+":"+pad2(now.getMinutes()), ts:now.getTime(),
+      caller, code:form.code, note:(form.note||"").trim(),
+      promiseDate: isProm ? form.promiseDate : "", promiseAmt: isProm ? Number(form.promiseAmt) : 0,
+      balAtCall: Math.round(logRow.bal*100)/100, osAsOn: osAsOn||""};
+    setSaving(true);
+    DB.ref(CALLS_PATH+"/calls/"+id).set(rec)
+      .then(()=>{ setSaving(false); notify("✅ "+logRow.flat+" — "+CODE_MAP[form.code].l); setLogRow(null); })
+      .catch(e=>{ console.error(e); setSaving(false); notify("Save failed — check connection","error"); });
+  };
+  const deleteCall = c => {
+    if(!window.confirm("Delete this call entry?")) return;
+    DB.ref(CALLS_PATH+"/calls/"+c.id).remove().then(()=>notify("Entry deleted")).catch(()=>notify("Delete failed","error"));
+  };
+  const canDelete = c => mode==="admin" || (c.caller===caller && c.date===today);
+  const addCaller = () => {
+    const n = newCaller.trim(); if(!n) return;
+    if(callerNames.map(x=>x.toLowerCase()).indexOf(n.toLowerCase())>=0){ pickCaller(n); setNewCaller(""); return; }
+    DB.ref(CALLS_PATH+"/callers").set(callerNames.concat([n])).then(()=>{ pickCaller(n); setNewCaller(""); notify("Caller added"); });
+  };
+  const statement = r => {
+    const f = ledger && ledger.flats ? ledger.flats[r.unitNo] : null;
+    if(!f || !f.tx.length){ notify("No ledger uploaded for this flat","error"); return; }
+    if(downloadStatementPdf(r.flat, f.names, f.tx, ledger.meta.asof)) notify("✅ Statement downloaded");
+  };
+
+  /* caller name gate */
+  if(!caller) return (
+    <div className="max-w-md mx-auto px-4 py-10">
+      <div className="bg-white rounded-2xl border border-amber-100 shadow-sm p-6">
+        <h2 className="playfair text-xl font-bold text-amber-900 mb-1">Who is calling?</h2>
+        <p className="text-xs text-gray-500 mb-4">Your name is stamped on every call you log. Remembered on this phone.</p>
+        <div className="space-y-2 mb-4">
+          {(mode==="admin" ? callerNames.concat(["Admin"]) : callerNames).map(n=>(
+            <button key={n} onClick={()=>pickCaller(n)} className="w-full py-3 rounded-xl border border-amber-200 bg-amber-50 text-amber-900 font-bold hover:bg-amber-100">{n}</button>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <input value={newCaller} onChange={e=>setNewCaller(e.target.value)} placeholder="+ Add caller name" className={INP}/>
+          <button onClick={addCaller} className="btn-gold px-4 rounded-lg text-sm">Add</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  const TABS = [["pending","Pending",active.filter(r=>!r.calledThisWeek).length],["called","Called",calledWk.length],
+                ["promises","Promises",rows.filter(r=>r.ps&&!r.ps.done).length],["flags","Flags",active.filter(r=>r.flags.length).length],
+                ["cleared","Cleared",rows.filter(r=>!r.active&&r.hist.length).length],["all","All",rows.length]];
+  const isProm = form.code && CODE_MAP[form.code].promise;
+
+  return (
+    <div className="max-w-3xl mx-auto px-3 sm:px-4 py-4">
+      {/* week header */}
+      <div className="bg-white rounded-2xl border border-amber-100 shadow-sm p-4 mb-3">
+        <div className="flex justify-between items-start gap-2 mb-2">
+          <div>
+            <div className="text-xs font-bold text-gray-400 uppercase tracking-wider">Week {fmtD(wk)} – {fmtD(wkEnd)}</div>
+            <div className="text-sm text-gray-600 mt-0.5">Caller: <b className="text-amber-900">{caller}</b>
+              <button onClick={()=>{ setCaller(""); lsDel("ccpt_caller"); }} className="ml-2 text-xs text-amber-600 underline">change</button></div>
+          </div>
+          <div className="text-right">
+            <div className="text-2xl font-black text-amber-900 leading-none">{calledWk.length}<span className="text-sm text-gray-400 font-bold"> / {active.length}</span></div>
+            <div className="text-[11px] text-gray-400 font-semibold">called this week</div>
+          </div>
+        </div>
+        <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+          <div className="h-full bg-gradient-to-r from-amber-500 to-emerald-500 rounded-full" style={{width:pct+"%"}}/>
+        </div>
+        <div className="flex justify-between text-[11px] text-gray-400 mt-1.5">
+          <span>Dues as per OS of {osAsOn?fmtD(osAsOn):"—"}</span>
+          <span>{ledger && ledger.meta ? "Ageing per ledger to "+fmtD(ledger.meta.asof) : "No ledger — ageing off"}</span>
+        </div>
+      </div>
+
+      {/* tabs */}
+      <div className="flex gap-1.5 overflow-x-auto pb-1 mb-2" style={{WebkitOverflowScrolling:"touch"}}>
+        {TABS.map(([k,l,n])=>(
+          <button key={k} onClick={()=>setTab(k)}
+            className={`px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap border ${tab===k?"bg-amber-700 text-white border-amber-700":"bg-white text-amber-800 border-amber-200"}`}>
+            {l} <span className={tab===k?"text-amber-200":"text-amber-500"}>{n}</span></button>
+        ))}
+      </div>
+      <div className="flex gap-2 mb-3">
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search flat / name" className="flex-1 min-w-0 px-3 py-2 border border-amber-200 rounded-lg text-sm bg-white"/>
+        <select value={tower} onChange={e=>setTower(e.target.value)} className="px-2 py-2 border border-amber-200 rounded-lg text-sm bg-white">
+          <option value="all">A+B</option><option value="A">A</option><option value="B">B</option></select>
+        <select value={sortBy} onChange={e=>setSortBy(e.target.value)} className="px-2 py-2 border border-amber-200 rounded-lg text-sm bg-white">
+          <option value="amt">Amount</option>{ageMap && <option value="age">Age</option>}<option value="flat">Flat</option></select>
+      </div>
+
+      {/* cards */}
+      <div className="space-y-2.5">
+        {tabRows.map(r=>{
+          const mob = firstMobile(r.mobile);
+          const broken = r.flags.indexOf("Broken promise")>=0;
+          return (
+            <div key={r.unitNo} className={`bg-white rounded-2xl border shadow-sm p-3.5 ${broken?"border-red-300":"border-amber-100"}`}>
+              <div className="flex justify-between items-start gap-2" onClick={()=>setHistRow(r)}>
+                <div className="min-w-0">
+                  <div className="font-black text-amber-900">{r.flat} <span className="font-semibold text-gray-700">· {r.name||"—"}</span></div>
+                  <div className="mt-0.5"><AgeLine age={r.active?r.age:null}/></div>
+                </div>
+                <div className={`font-black whitespace-nowrap ${r.active?"text-red-700":"text-emerald-700"}`}>{r.active?money(r.bal):"Cleared"}</div>
+              </div>
+              {broken && <div className="mt-2 text-xs font-bold text-red-700 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1.5">
+                ⚠ BROKEN PROMISE — {money(r.prom.promiseAmt)} due {fmtD(r.prom.promiseDate)} ({r.prom.caller})</div>}
+              <div className="flex flex-wrap gap-1.5 mt-2 items-center">
+                {r.last ? <><Chip tone={CODE_MAP[r.last.code].tone}>{CODE_MAP[r.last.code].l}</Chip>
+                  <span className="text-[11px] text-gray-400">{fmtD(r.last.date)} · {r.last.caller}</span></>
+                  : <span className="text-[11px] font-bold text-amber-700">Not called yet</span>}
+                {r.ps && !broken && <Chip tone={r.ps.tone}>Promise: {r.ps.s}</Chip>}
+                {r.flags.filter(f=>f!=="Broken promise").map(f=><Chip key={f} tone={f==="Dispute"||f==="Refused"?"bad":"warn"}>{f}</Chip>)}
+                <button onClick={()=>setHistRow(r)} className="ml-auto text-[11px] font-bold text-amber-600 underline">History{r.hist.length?" ("+r.hist.length+")":""}</button>
+              </div>
+              {r.last && r.last.note && <div className="text-[11px] text-gray-500 mt-1.5 italic truncate">“{r.last.note}”</div>}
+              {r.active && (
+                <div className="flex gap-2 mt-3">
+                  {mob ? <a href={"tel:"+mob} className="flex-1 text-center py-2 rounded-lg bg-emerald-600 text-white text-sm font-bold">📞 Call</a>
+                       : <span className="flex-1 text-center py-2 rounded-lg bg-gray-100 text-gray-400 text-sm font-bold">No mobile</span>}
+                  <button onClick={()=>openLog(r)} className="flex-1 py-2 rounded-lg btn-gold text-sm">+ Log outcome</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {tabRows.length===0 && <div className="text-center py-12 text-gray-300 text-sm">Nothing here</div>}
+      </div>
+
+      {mode==="caller" && (
+        <div className="text-center mt-8">
+          <button onClick={onExit} className="text-xs text-amber-500 underline">Log out</button>
+        </div>
+      )}
+
+      {/* log outcome sheet */}
+      <Modal open={!!logRow} onClose={()=>setLogRow(null)} title={logRow?("Log call — "+logRow.flat):""}>
+        {logRow && (
+          <div className="space-y-3">
+            <div className="flex justify-between text-sm bg-amber-50 border border-amber-100 rounded-xl px-3 py-2">
+              <span className="font-semibold text-gray-700 truncate">{logRow.name}</span>
+              <span className="font-black text-red-700">{money(logRow.bal)}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {CALL_CODES.map(c=>(
+                <button key={c.k} onClick={()=>setForm(f=>({...f,code:c.k}))}
+                  className={`text-left px-2.5 py-2 rounded-lg border text-xs font-bold leading-tight ${form.code===c.k?"bg-amber-700 text-white border-amber-700":"bg-white text-gray-700 border-gray-200"}`}>{c.l}</button>
+              ))}
+            </div>
+            {isProm && (
+              <div className="grid grid-cols-2 gap-2 bg-emerald-50 border border-emerald-200 rounded-xl p-2.5">
+                <Fld label="Promise date"><input type="date" value={form.promiseDate} onChange={e=>setForm(f=>({...f,promiseDate:e.target.value}))} className={INP}/></Fld>
+                <Fld label="Amount (₹)"><input type="number" value={form.promiseAmt} onChange={e=>setForm(f=>({...f,promiseAmt:e.target.value}))} className={INP}/></Fld>
+              </div>
+            )}
+            <Fld label="Note (optional)"><input value={form.note} onChange={e=>setForm(f=>({...f,note:e.target.value}))} className={INP} placeholder="Anything the code doesn't capture"/></Fld>
+            <div className="flex gap-2 pt-1">
+              <button onClick={()=>setLogRow(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+              <button onClick={saveCall} disabled={saving} className="flex-1 py-2.5 btn-gold rounded-xl text-sm disabled:opacity-50">{saving?"Saving…":"Save"}</button>
+            </div>
+            <p className="text-[11px] text-gray-400 text-center">Logged as {caller} · {fmtD(today)}</p>
+          </div>
+        )}
+      </Modal>
+
+      {/* history sheet */}
+      <Modal open={!!histRow} onClose={()=>setHistRow(null)} title={histRow?(histRow.flat+" — call history"):""} wide>
+        {histRow && (()=>{ const r = rows.find(x=>x.unitNo===histRow.unitNo) || histRow; return (
+          <div className="space-y-3">
+            <div className="bg-amber-50 border border-amber-100 rounded-xl p-3">
+              <div className="flex justify-between items-start gap-2">
+                <div><div className="font-black text-amber-900">{r.name||"—"}</div>
+                  <div className="text-xs text-gray-500">{firstMobile(r.mobile)||"no mobile"}</div></div>
+                <div className={`font-black ${r.active?"text-red-700":"text-emerald-700"}`}>{r.active?money(r.bal):"Cleared"}</div>
+              </div>
+              {r.age && r.age.oldest && r.active && (
+                <div className="grid grid-cols-4 gap-1.5 mt-2.5 text-center">
+                  {[["Current",r.age.cur],["1–2 m",r.age.b12],["3–5 m",r.age.b35],["6+ m",r.age.b6]].map(([l,v])=>(
+                    <div key={l} className={`rounded-lg py-1.5 ${l==="6+ m"&&v>0?"bg-red-100":"bg-white"} border border-amber-100`}>
+                      <div className="text-[10px] text-gray-400 font-bold uppercase">{l}</div>
+                      <div className="text-xs font-bold text-gray-700">{v?moneyS(v):"—"}</div></div>))}
+                  <div className="col-span-4 text-[10px] text-gray-400">Ageing per ledger to {fmtD(ledger.meta.asof)}</div>
+                </div>
+              )}
+              {r.ps && <div className="mt-2"><Chip tone={r.ps.tone}>Promise {money(r.prom.promiseAmt)} by {fmtD(r.prom.promiseDate)}: {r.ps.s}</Chip></div>}
+              {ledger && ledger.flats && ledger.flats[r.unitNo] && (
+                <button onClick={()=>statement(r)} className="mt-2.5 w-full py-2 rounded-lg bg-slate-700 text-white text-xs font-bold">📄 Ledger statement PDF (to {fmtD(ledger.meta.asof)})</button>
+              )}
+            </div>
+            <div className="space-y-1.5 max-h-80 overflow-y-auto">
+              {r.hist.slice().reverse().map(c=>(
+                <div key={c.id} className="border border-gray-100 rounded-lg px-3 py-2">
+                  <div className="flex justify-between items-center gap-2">
+                    <Chip tone={CODE_MAP[c.code]?CODE_MAP[c.code].tone:"info"}>{CODE_MAP[c.code]?CODE_MAP[c.code].l:c.code}</Chip>
+                    <span className="text-[11px] text-gray-400 whitespace-nowrap">{fmtD(c.date)} {c.time} · {c.caller}</span>
+                  </div>
+                  {c.promiseDate && <div className="text-xs text-emerald-800 mt-1">Promise {money(c.promiseAmt)} by {fmtD(c.promiseDate)}</div>}
+                  {c.note && <div className="text-xs text-gray-600 mt-1">{c.note}</div>}
+                  <div className="flex justify-between items-center mt-1">
+                    <span className="text-[10px] text-gray-400">Balance at call {money(c.balAtCall)}</span>
+                    {canDelete(c) && <button onClick={()=>deleteCall(c)} className="text-[11px] text-gray-300 hover:text-red-500">Delete</button>}
+                  </div>
+                </div>
+              ))}
+              {!r.hist.length && <div className="text-center text-sm text-gray-300 py-6">No calls logged yet</div>}
+            </div>
+            {r.active && <button onClick={()=>{ setHistRow(null); openLog(r); }} className="w-full py-2.5 btn-gold rounded-xl text-sm">+ Log outcome</button>}
+          </div> ); })()}
+      </Modal>
+    </div>
+  );
+}
+
+/* ══════════ LIVE STATUS PAGE (#status) — read-only, no mobile numbers ══════════ */
+function StatusPage({duesRows, calls, ageMap, osAsOn, ledgerAsOf}){
+  const today = todayISO(); const wk = weekStartISO(today), wkEnd = addDaysISO(wk,6);
+  const rows = React.useMemo(() => deriveCalls(duesRows, calls, ageMap, today), [duesRows, calls, ageMap, today]);
+  const st = callStats(rows, calls, wk, wkEnd, today);
+  const [show, setShow] = useState("all");
+  const list = rows.filter(r => show==="all" ? r.active : show==="pending" ? r.active && !r.calledThisWeek
+                       : show==="broken" ? r.flags.indexOf("Broken promise")>=0 : show==="promises" ? r.ps && !r.ps.done : true)
+                   .sort((a,b)=>b.bal-a.bal);
+  const card = (l,v,c) => <div className="bg-white border border-amber-100 rounded-xl p-3"><div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">{l}</div><div className={`text-lg font-black ${c||"text-amber-900"}`}>{v}</div></div>;
+  return (
+    <div className="min-h-screen" style={{background:"var(--cream)"}}>
+      <div className="header-pattern" style={{background:"linear-gradient(135deg,#1A1410,#3D2B1F)"}}>
+        <div className="max-w-5xl mx-auto px-4 py-5">
+          <div className="text-amber-400 text-[11px] font-semibold tracking-[3px] uppercase">The Residency City Center · Patna</div>
+          <h1 className="playfair text-2xl font-bold text-white">Dues Calling — Live Status</h1>
+          <p className="text-amber-200/60 text-xs mt-1">Week {fmtD(wk)} – {fmtD(wkEnd)} · Dues as per OS of {osAsOn?fmtD(osAsOn):"—"} · updates as calls are logged</p>
+        </div>
+      </div>
+      <div className="max-w-5xl mx-auto px-4 py-5">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5 mb-4">
+          {card("Flats with dues", st.active.length)}
+          {card("Outstanding", money(st.activeAmt), "text-red-700")}
+          {card("Called this week", st.nFlats+" / "+st.active.length, "text-emerald-700")}
+          {card("Not yet called", st.pending.length, "text-amber-700")}
+          {card("Promises this week", st.promisesMade.length)}
+          {card("Amount promised", money(st.promisedAmt), "text-emerald-700")}
+          {card("Promises due", st.dueInRange.length, "text-blue-700")}
+          {card("Broken promises", st.broken.length, "text-red-700")}
+        </div>
+        <div className="grid md:grid-cols-2 gap-3 mb-4">
+          <div className="bg-white border border-amber-100 rounded-xl p-3">
+            <div className="text-xs font-bold text-amber-900 mb-2">By caller (this week)</div>
+            {Object.keys(st.byCaller).length ? Object.keys(st.byCaller).sort().map(k=>(
+              <div key={k} className="flex justify-between text-sm py-0.5"><span>{k}</span><b>{st.byCaller[k].calls} calls · {Object.keys(st.byCaller[k].flats).length} flats</b></div>
+            )) : <div className="text-xs text-gray-400">No calls yet this week</div>}
+          </div>
+          <div className="bg-white border border-amber-100 rounded-xl p-3">
+            <div className="text-xs font-bold text-amber-900 mb-2">Outcomes (this week)</div>
+            {CALL_CODES.filter(c=>st.byCode[c.k]).map(c=>(
+              <div key={c.k} className="flex justify-between text-sm py-0.5"><span>{c.l}</span><b>{st.byCode[c.k]}</b></div>
+            ))}
+            {!st.nCalls && <div className="text-xs text-gray-400">—</div>}
+          </div>
+        </div>
+        <div className="flex gap-1.5 flex-wrap mb-2">
+          {[["all","All with dues"],["pending","Not called"],["promises","Open promises"],["broken","Broken"]].map(([k,l])=>(
+            <button key={k} onClick={()=>setShow(k)} className={`px-3 py-1.5 rounded-full text-xs font-bold border ${show===k?"bg-amber-700 text-white border-amber-700":"bg-white text-amber-800 border-amber-200"}`}>{l}</button>))}
+        </div>
+        <div className="bg-white rounded-2xl border border-amber-100 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead><tr style={{background:"linear-gradient(135deg,#1A252F,#3D2B1F)"}}>
+                {["Flat","Owner","Outstanding"].concat(ageMap?["Unpaid since"]:[]).concat(["Last call","Outcome","Promise"]).map(h=>(
+                  <th key={h} className="px-3 py-2.5 text-left text-[11px] font-semibold text-amber-300 uppercase whitespace-nowrap">{h}</th>))}</tr></thead>
+              <tbody className="divide-y divide-amber-50">
+                {list.map(r=>(
+                  <tr key={r.unitNo} className={r.flags.indexOf("Broken promise")>=0?"bg-red-50/60":""}>
+                    <td className="px-3 py-2 font-bold text-amber-900 whitespace-nowrap">{r.flat}</td>
+                    <td className="px-3 py-2 text-gray-700 max-w-[180px] truncate">{r.name}</td>
+                    <td className="px-3 py-2 font-bold text-red-700 whitespace-nowrap text-right">{r.active?money(r.bal):"Cleared"}</td>
+                    {ageMap && <td className="px-3 py-2 whitespace-nowrap"><AgeLine age={r.active?r.age:null}/></td>}
+                    <td className="px-3 py-2 text-xs text-gray-500 whitespace-nowrap">{r.last?fmtD(r.last.date)+" · "+r.last.caller:<b className="text-amber-700">Not called</b>}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">{r.last?<Chip tone={CODE_MAP[r.last.code].tone}>{CODE_MAP[r.last.code].l}</Chip>:"—"}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">{r.ps?<Chip tone={r.ps.tone}>{r.ps.s}</Chip>:"—"}</td>
+                  </tr>))}
+              </tbody>
+            </table>
+          </div>
+          {!list.length && <div className="text-center py-10 text-gray-300 text-sm">Nothing here</div>}
+        </div>
+        <p className="text-[11px] text-gray-400 mt-3 text-center">Read-only. Mobile numbers are not shown on this page.{ledgerAsOf?" Ageing per ledger to "+fmtD(ledgerAsOf)+".":""}</p>
+      </div>
+    </div>
+  );
+}
+
+
 function App() {
   const [records,    setRecords]    = useState([]);
   const [loaded,     setLoaded]     = useState(false);
@@ -292,6 +994,19 @@ function App() {
   const [logScope,    setLogScope]    = useState("pending");
   const [editCollId,  setEditCollId]  = useState(null);
   const [moveFrom,    setMoveFrom]    = useState("");
+  /* calls + ledger */
+  const [calls,       setCalls]       = useState([]);
+  const [callers,     setCallers]     = useState([]);
+  const [ledger,      setLedger]      = useState(null);
+  const [ledgerBusy,  setLedgerBusy]  = useState(null);
+  const [ledgerParsed,setLedgerParsed]= useState(null);
+  const [callsAuth,   setCallsAuth]   = useState(lsGet("ccpt_calls_ok")==="1");
+  const [callsPin,    setCallsPin]    = useState("");
+  const [callsPinErr, setCallsPinErr] = useState(false);
+  const [crFrom,      setCrFrom]      = useState(weekStartISO(todayISO()));
+  const [crTo,        setCrTo]        = useState(addDaysISO(weekStartISO(todayISO()),6));
+  const [crMobile,    setCrMobile]    = useState(false);
+  const [crHistory,   setCrHistory]   = useState(true);
   const [moveTo,      setMoveTo]      = useState("");
 
   /* deep link: #admin opens admin login directly */
@@ -299,10 +1014,36 @@ function App() {
     const go = () => {
       const h = (window.location.hash||"").toLowerCase();
       if(h==="#admin"||h==="#/admin"){ setView("admin"); }
+      else if(h==="#calls"||h==="#/calls"){ setView("calls"); }
+      else if(h==="#status"||h==="#/status"){ setView("status"); }
     };
     go();
     window.addEventListener("hashchange", go);
     return () => window.removeEventListener("hashchange", go);
+  }, []);
+
+  /* calls listener — calls keyed by id so two callers never overwrite each other */
+  useEffect(() => {
+    const ref = DB.ref(CALLS_PATH);
+    ref.on("value", snap => {
+      const raw = snap.val() || {};
+      setCalls(toArr(raw.calls).filter(x => x && x.unitNo && x.code));
+      const cl = toArr(raw.callers).filter(x => typeof x === "string" && x.trim());
+      if(!cl.length){ DB.ref(CALLS_PATH+"/callers").set(DEFAULT_CALLERS).catch(console.error); }
+      setCallers(cl.length ? cl : DEFAULT_CALLERS);
+    }, e => console.error(e));
+    return () => ref.off();
+  }, []);
+
+  /* ledger listener (optional data) */
+  useEffect(() => {
+    const ref = DB.ref(LEDGER_PATH);
+    ref.on("value", snap => {
+      const raw = snap.val();
+      if(!raw || !raw.meta || !raw.flats){ setLedger(null); return; }
+      setLedger({meta: raw.meta, flats: normLedgerFlats(raw.flats)});
+    }, e => console.error(e));
+    return () => ref.off();
   }, []);
 
   /* dues listener */
@@ -524,6 +1265,14 @@ function App() {
     });
   }, [records, snapshots, collections]);
 
+  /* ageing per flat from the optional ledger upload */
+  const ageMap = React.useMemo(() => {
+    if(!ledger || !ledger.flats || !ledger.meta) return null;
+    const m = {};
+    Object.keys(ledger.flats).forEach(u => { m[u] = computeAgeing(ledger.flats[u].tx, ledger.meta.asof); });
+    return m;
+  }, [ledger]);
+
   const duesTotals = duesRows.reduce((a,r)=>({
     debit:  a.debit  + (r.opening>0 ? r.opening : 0),          /* as billed in Tally */
     credit: a.credit + (r.outstanding<0 ? -r.outstanding : 0), /* current advances, incl. overpayment */
@@ -563,7 +1312,7 @@ function App() {
       const buf = await file.arrayBuffer();
       const pdf = await window.pdfjsLib.getDocument({data:buf}).promise;
 
-      let xDebit=null, xCredit=null, tower=null;
+      let xDebit=null, xCredit=null, tower=null, asOf=null;
       const rows=[], warnings=[]; let stated=null;
 
       for(let p=1; p<=pdf.numPages; p++){
@@ -588,6 +1337,10 @@ function App() {
           if(tower===null){
             const tm = text.match(/Tower\s*:\s*([AB])/i);
             if(tm) tower = tm[1].toUpperCase();
+          }
+          if(asOf===null){
+            const am = text.match(/to\s+(\d{1,2}-[A-Za-z]{3}-\d{2})/);
+            if(am) asOf = tallyDateISO(am[1]);
           }
           /* header row -> capture column centres */
           const dIt = items.find(i=>/^Debit$/i.test(i.t));
@@ -644,7 +1397,7 @@ function App() {
                 total: rs.reduce((s,r)=>s+(r.debit||0)-(r.credit||0),0)};
       });
 
-      setParsed({tower: tower||rows[0].tower, rows, sumD, sumC, stated, ok, dups,
+      setParsed({tower: tower||rows[0].tower, rows, sumD, sumC, stated, ok, dups, asOf: asOf || todayISO(), asOfFound: !!asOf,
                  warnings:[...new Set(warnings)], fileName:file.name});
       setParsing(false);
     } catch(e){
@@ -655,7 +1408,7 @@ function App() {
   /* commit parsed snapshot */
   const commitSnapshot = () => {
     if(!parsed) return;
-    const today = new Date().toISOString().slice(0,10);
+    const today = parsed.asOf || todayISO();   /* snapshot dated as per the report, not the upload day */
     const existing = snapshots.find(s => s.date===today && s.tower===parsed.tower);
     const snap = {
       id: existing ? existing.id : uid(),
@@ -670,7 +1423,8 @@ function App() {
     const upd = collections.map(cn => {
       if(cn.reconciled) return cn;
       const rowHere = parsed.rows.find(r=>r.unitNo===cn.unitNo);
-      return rowHere ? {...cn, reconciled:true, reconciledOn:today, reconciledSnap:snap.id} : cn;
+      /* only receipts dated on/before the report date can be inside Tally's figure */
+      return (rowHere && (cn.date||"") <= today) ? {...cn, reconciled:true, reconciledOn:today, reconciledSnap:snap.id} : cn;
     });
     setSyncSt("saving");
     DB.ref(DUES_PATH).update({snapshots:[snap,...others], collections:upd})
@@ -1299,6 +2053,45 @@ function App() {
     notify("Report opened — tap Save as PDF");
   };
 
+  /* ── optional full-ledger upload → ageing + statements ── */
+  const parseLedgerFile = async (file) => {
+    setLedgerParsed(null); setLedgerBusy({p:0,n:0});
+    try {
+      if(!window.pdfjsLib){ notify("PDF engine not loaded","error"); setLedgerBusy(null); return; }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      const pdf = await window.pdfjsLib.getDocument({data: await file.arrayBuffer()}).promise;
+      const r = await parseLedgerPdf(pdf, (p,n)=>{ if(p%10===0||p===n) setLedgerBusy({p,n}); });
+      if(!r.ledgers.length){ notify("No flat ledgers found in this PDF","error"); setLedgerBusy(null); return; }
+      const flats = {};
+      r.ledgers.forEach(l => { const f = flats[l.unitNo] = flats[l.unitNo] || {names:[], tx:[]};
+        if(f.names.indexOf(l.name)<0) f.names.push(l.name); f.tx = f.tx.concat(l.tx); });
+      setLedgerParsed({flats, ledgers:r.ledgers.length, latest:r.latest, asof:r.latest, check:r.check, fileName:file.name});
+    } catch(e){ console.error(e); notify("Could not read this ledger PDF","error"); }
+    setLedgerBusy(null);
+  };
+  const ledgerPreview = React.useMemo(() => {
+    if(!ledgerParsed) return null;
+    let n=0, tot=0, g3=0, g3t=0;
+    Object.keys(ledgerParsed.flats).forEach(u => { const a = computeAgeing(ledgerParsed.flats[u].tx, ledgerParsed.asof);
+      if(a.bal>=10){ n++; tot+=a.bal; if(a.months>=3){ g3++; g3t+=a.bal; } } });
+    return {n, tot, g3, g3t};
+  }, [ledgerParsed]);
+  const commitLedger = () => {
+    if(!ledgerParsed) return;
+    const payload = {meta:{asof:ledgerParsed.asof, latestTxn:ledgerParsed.latest, uploadedAt:tsNow(), fileName:ledgerParsed.fileName,
+                           ledgers:ledgerParsed.ledgers, verified:ledgerParsed.check.ok, mismatched:ledgerParsed.check.bad},
+                     flats:ledgerParsed.flats};
+    setSyncSt("saving");
+    DB.ref(LEDGER_PATH).set(payload)
+      .then(()=>{ setSyncSt("synced"); notify("✅ Ledger saved — ageing as on "+fmtD(ledgerParsed.asof)); setLedgerParsed(null); setModal(null); })
+      .catch(e=>{ console.error(e); setSyncSt("error"); notify("Save failed","error"); });
+  };
+  const callsLogin = () => {
+    if(callsPin===CALLS_PIN){ setCallsAuth(true); lsSet("ccpt_calls_ok","1"); setCallsPinErr(false); setCallsPin(""); }
+    else setCallsPinErr(true);
+  };
+  const callsLogout = () => { setCallsAuth(false); lsDel("ccpt_calls_ok"); window.location.hash=""; setView("home"); };
+
   const adminLogin = () => {
     if(adminPw===ADMIN_PASSWORD){setAdminAuth(true);setAdminPwErr(false);setModal(null);setAdminPw("");}
     else setAdminPwErr(true);
@@ -1312,6 +2105,38 @@ function App() {
   );
 
   /* ══════════ HOME VIEW ══════════ */
+  /* ══════════ LIVE STATUS (#status) ══════════ */
+  if(view==="status") return (
+    <StatusPage duesRows={duesRows} calls={calls} ageMap={ageMap} osAsOn={asOnDate}
+                ledgerAsOf={ledger&&ledger.meta?ledger.meta.asof:null}/>
+  );
+
+  /* ══════════ CALLER APP (#calls) ══════════ */
+  if(view==="calls") return (
+    <div className="min-h-screen" style={{background:"var(--cream)"}}>
+      {toast && <Toast {...toast}/>}
+      <div style={{background:"linear-gradient(135deg,#1A1410,#3D2B1F)"}} className="px-4 py-3 flex justify-between items-center sticky top-0 z-40">
+        <span className="playfair text-white font-semibold">📞 Dues Calling</span>
+        <span className="text-amber-300/70 text-[11px]">The Residency · CCPT</span>
+      </div>
+      {!callsAuth ? (
+        <div className="max-w-sm mx-auto px-4 py-12">
+          <div className="bg-white rounded-2xl border border-amber-100 shadow-sm p-6">
+            <h2 className="playfair text-xl font-bold text-amber-900 mb-4 text-center">Enter PIN</h2>
+            <input type="password" inputMode="numeric" value={callsPin} autoFocus
+              onChange={e=>{setCallsPin(e.target.value);setCallsPinErr(false);}}
+              onKeyDown={e=>e.key==="Enter"&&callsLogin()} className={INP+" text-center text-lg tracking-widest"} placeholder="••••"/>
+            {callsPinErr && <p className="text-red-600 text-xs font-semibold mt-2 text-center">Incorrect PIN</p>}
+            <button onClick={callsLogin} className="btn-gold w-full py-3 rounded-xl text-sm mt-4">Open call list →</button>
+          </div>
+        </div>
+      ) : (
+        <CallsModule mode="caller" duesRows={duesRows} calls={calls} callers={callers} ledger={ledger}
+                     ageMap={ageMap} notify={notify} onExit={callsLogout} osAsOn={asOnDate}/>
+      )}
+    </div>
+  );
+
   if(view==="home") return (
     <div className="min-h-screen" style={{background:"var(--cream)"}}>
       {toast && <Toast {...toast}/>}
@@ -1543,7 +2368,7 @@ function App() {
         {/* Tab bar */}
         <div className="bg-white border-b border-amber-100 px-4 sticky top-[57px] z-30">
           <div className="max-w-7xl mx-auto flex gap-1">
-            {[["directory","👥 Directory"],["dues","💰 Dues"],["reports","📄 Reports"]].map(([k,l])=>(
+            {[["directory","👥 Directory"],["dues","💰 Dues"],["calls","📞 Calls"],["reports","📄 Reports"]].map(([k,l])=>(
               <button key={k} onClick={()=>setAdminTab(k)}
                 className={`px-4 py-3 text-sm font-semibold border-b-2 transition-colors ${adminTab===k?"border-amber-600 text-amber-800":"border-transparent text-gray-400 hover:text-amber-700"}`}>
                 {l}
@@ -1711,6 +2536,11 @@ function App() {
                     ⚠ {liveCollections.length} pending reconciliation
                   </span>
                 )}
+                <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${ledger&&ledger.meta?"bg-blue-50 text-blue-700 border-blue-200":"bg-gray-50 text-gray-400 border-gray-200"}`}>
+                  {ledger&&ledger.meta ? "📒 Ledger to "+fmtD(ledger.meta.asof) : "📒 No ledger (optional)"}
+                </span>
+                <button onClick={()=>{setLedgerParsed(null);setModal("ledger");}}
+                  className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-2 rounded-lg text-xs font-semibold whitespace-nowrap">⬆ Ledger PDF</button>
                 <button onClick={()=>{setParsed(null);setModal("upload");}}
                   className="btn-gold px-4 py-2 rounded-lg text-xs whitespace-nowrap">⬆ Upload Dues PDF</button>
               </div>
@@ -1873,11 +2703,44 @@ function App() {
           </>)}
         </div>
 
+        {/* ══════════ CALLS TAB ══════════ */}
+        <div style={{display: adminTab==="calls"?"block":"none"}}>
+          <div className="max-w-3xl mx-auto px-3 sm:px-4 pt-4">
+            <div className="bg-blue-50 border border-blue-100 rounded-xl px-3 py-2.5 text-xs text-blue-800 flex flex-wrap gap-x-4 gap-y-1">
+              <span>Caller link: <b>residencyccpt.netlify.app/#calls</b> · PIN {CALLS_PIN}</span>
+              <span>Committee live page: <b>residencyccpt.netlify.app/#status</b></span>
+            </div>
+          </div>
+          <CallsModule mode="admin" duesRows={duesRows} calls={calls} callers={callers} ledger={ledger}
+                       ageMap={ageMap} notify={notify} onExit={()=>{}} osAsOn={asOnDate}/>
+        </div>
+
         {/* ══════════ REPORTS TAB ══════════ */}
         <div className="max-w-7xl mx-auto px-4 py-7" style={{display: adminTab==="reports"?"block":"none"}}>
           <h2 className="playfair text-2xl font-bold text-amber-900 mb-1">Reports</h2>
           <p className="text-sm text-gray-400 mb-6">Generate and download reports for committee use.</p>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+
+            <div className="bg-white rounded-2xl border border-emerald-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">📞</div>
+              <h3 className="font-bold text-amber-900 mb-1">Dues Calling Report</h3>
+              <p className="text-xs text-gray-500 mb-1">Calls, outcomes, promises kept and broken, flat-wise status — for any period. Optional call-history appendix.</p>
+              <p className="text-xs text-amber-700 font-semibold mb-4">Mobile numbers optional</p>
+              <button onClick={()=>setModal("callReport")} className="btn-gold w-full py-2.5 rounded-xl text-sm">Generate</button>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-blue-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">🔗</div>
+              <h3 className="font-bold text-amber-900 mb-1">Live Calling Status (committee)</h3>
+              <p className="text-xs text-gray-500 mb-1">Read-only page that updates as calls are logged. No login, no mobile numbers.</p>
+              <p className="text-xs text-emerald-700 font-semibold mb-4">residencyccpt.netlify.app/#status</p>
+              <div className="flex gap-2">
+                <button onClick={()=>{ const u="https://residencyccpt.netlify.app/#status";
+                    try{ navigator.clipboard.writeText(u).then(()=>notify("Link copied")); }catch(e){ notify(u,"info"); } }}
+                  className="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2.5 rounded-xl text-sm font-semibold">Copy link</button>
+                <a href="#status" target="_blank" rel="noopener" className="flex-1 text-center btn-gold py-2.5 rounded-xl text-sm">Open</a>
+              </div>
+            </div>
 
             <div className="bg-white rounded-2xl border border-amber-100 shadow-sm p-5">
               <div className="text-2xl mb-2">📋</div>
@@ -1962,6 +2825,84 @@ function App() {
           </div>
         </Modal>
 
+        {/* Ledger Upload Modal (optional) */}
+        <Modal open={modal==="ledger"} onClose={()=>{ if(!ledgerBusy){ setModal(null); setLedgerParsed(null);} }} title="📒 Upload Full Ledger PDF (optional)" wide>
+          <div className="space-y-4">
+            {!ledgerParsed && (
+              <>
+                <div className="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center bg-slate-50">
+                  <p className="text-sm font-semibold text-slate-800 mb-1">Tally “All ledger” PDF — Sundry Debtors, all flats</p>
+                  <p className="text-xs text-gray-500 mb-4">Adds ageing (unpaid since, months overdue) and per-flat statements. Calling works without it.</p>
+                  <input type="file" accept="application/pdf" disabled={!!ledgerBusy}
+                    onChange={e=>{ const f=e.target.files&&e.target.files[0]; if(f) parseLedgerFile(f); }} className="text-sm mx-auto block"/>
+                  {ledgerBusy && <p className="text-sm text-slate-700 font-semibold mt-3 animate-pulse">⟳ Reading page {ledgerBusy.p} of {ledgerBusy.n||"…"}</p>}
+                </div>
+                {ledger && ledger.meta && (
+                  <p className="text-xs text-gray-500">Current: ledger to <b>{fmtDL(ledger.meta.asof)}</b>, uploaded {ledger.meta.uploadedAt}, {ledger.meta.ledgers} ledgers. A new upload replaces it.</p>
+                )}
+              </>
+            )}
+            {ledgerParsed && ledgerPreview && (
+              <>
+                <div className={`rounded-xl p-3 text-xs font-semibold border ${ledgerParsed.check.bad?"bg-red-50 border-red-200 text-red-800":"bg-emerald-50 border-emerald-200 text-emerald-800"}`}>
+                  {ledgerParsed.check.bad
+                    ? `✕ ${ledgerParsed.check.bad} ledgers don't match their printed closing balance: ${ledgerParsed.check.badList.join(", ")}`
+                    : `✓ ${ledgerParsed.check.ok} of ${ledgerParsed.check.ok} printed closing balances reconcile (${ledgerParsed.check.nomark} ledgers have none printed)`}
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div className="bg-white rounded-lg p-3 border border-amber-100"><div className="text-xs text-gray-400 font-bold uppercase">Ledgers / flats</div>
+                    <div className="font-black text-amber-900">{ledgerParsed.ledgers} / {Object.keys(ledgerParsed.flats).length}</div></div>
+                  <div className="bg-white rounded-lg p-3 border border-amber-100"><div className="text-xs text-gray-400 font-bold uppercase">Latest entry</div>
+                    <div className="font-black text-amber-900">{fmtDL(ledgerParsed.latest)}</div></div>
+                  <div className="bg-white rounded-lg p-3 border border-red-100"><div className="text-xs text-gray-400 font-bold uppercase">Flats with dues</div>
+                    <div className="font-black text-red-700">{ledgerPreview.n} · {money(ledgerPreview.tot)}</div></div>
+                  <div className="bg-white rounded-lg p-3 border border-red-100"><div className="text-xs text-gray-400 font-bold uppercase">3+ months</div>
+                    <div className="font-black text-red-700">{ledgerPreview.g3} · {money(ledgerPreview.g3t)}</div></div>
+                </div>
+                <Fld label="Ledger as on (bank statement date)">
+                  <input type="date" value={ledgerParsed.asof} onChange={e=>setLedgerParsed(lp=>({...lp,asof:e.target.value}))} className={INP}/>
+                </Fld>
+                <div className="flex gap-3 pt-2 border-t border-amber-100">
+                  <button onClick={()=>setLedgerParsed(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Back</button>
+                  <button onClick={commitLedger} className="btn-gold flex-1 py-2.5 rounded-xl text-sm">Save Ledger</button>
+                </div>
+              </>
+            )}
+          </div>
+        </Modal>
+
+        {/* Calling Report Modal */}
+        <Modal open={modal==="callReport"} onClose={()=>setModal(null)} title="📞 Dues Calling Report">
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-3">
+              <Fld label="From"><input type="date" value={crFrom} onChange={e=>setCrFrom(e.target.value)} className={INP}/></Fld>
+              <Fld label="To"><input type="date" value={crTo} onChange={e=>setCrTo(e.target.value)} className={INP}/></Fld>
+            </div>
+            <div className="flex gap-2 flex-wrap">
+              {[["This week",()=>{const w=weekStartISO(todayISO());setCrFrom(w);setCrTo(addDaysISO(w,6));}],
+                ["Last week",()=>{const w=addDaysISO(weekStartISO(todayISO()),-7);setCrFrom(w);setCrTo(addDaysISO(w,6));}],
+                ["This month",()=>{const t=todayISO();setCrFrom(t.slice(0,8)+"01");setCrTo(t);}]].map(([l,fn])=>(
+                <button key={l} onClick={fn} className="text-xs bg-amber-50 text-amber-800 border border-amber-200 px-3 py-1.5 rounded-lg font-semibold hover:bg-amber-100">{l}</button>))}
+            </div>
+            <label className="flex items-center gap-3 p-3 rounded-xl border border-amber-100 cursor-pointer">
+              <input type="checkbox" checked={crHistory} onChange={e=>setCrHistory(e.target.checked)} className="w-4 h-4 accent-amber-700"/>
+              <span className="text-sm font-semibold text-amber-900">Include flat-wise call history appendix</span></label>
+            <label className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer ${crMobile?"border-red-200 bg-red-50":"border-emerald-200 bg-emerald-50"}`}>
+              <input type="checkbox" checked={crMobile} onChange={e=>setCrMobile(e.target.checked)} className="w-4 h-4 accent-amber-700"/>
+              <span className="text-sm font-semibold text-amber-900 flex-1">Include mobile numbers</span>
+              <span className={`text-xs font-bold ${crMobile?"text-red-700":"text-emerald-700"}`}>{crMobile?"Committee only":"Share-safe"}</span></label>
+            <div className="flex gap-3 pt-2 border-t border-amber-100">
+              <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+              <button onClick={()=>{
+                  if(crFrom>crTo){ notify("From date is after To date","error"); return; }
+                  const rws = deriveCalls(duesRows, calls, ageMap, todayISO());
+                  if(downloadCallingPdf(rws, calls, crFrom, crTo, crMobile, crHistory, todayISO(), asOnDate, ledger&&ledger.meta?ledger.meta.asof:null)){
+                    setModal(null); notify("✅ Calling report downloaded"); } else notify("PDF library not loaded","error"); }}
+                className="btn-gold flex-1 py-2.5 rounded-xl text-sm">📥 Download</button>
+            </div>
+          </div>
+        </Modal>
+
         {/* Upload Dues Modal */}
         <Modal open={modal==="upload"} onClose={()=>{setModal(null);setParsed(null);}} title="⬆ Upload Tally Dues PDF" wide>
           <div className="space-y-4">
@@ -1988,6 +2929,13 @@ function App() {
                   <div className="flex justify-between items-center mb-2">
                     <span className="font-bold text-amber-900">Tower {parsed.tower}</span>
                     <span className="text-xs text-gray-500">{parsed.rows.length} rows · {parsed.fileName}</span>
+                  </div>
+                  <div className="flex items-center gap-2 mb-3 text-xs">
+                    <span className="font-bold text-gray-500 uppercase">Balances as on</span>
+                    <input type="date" value={parsed.asOf} onChange={e=>setParsed(pp=>({...pp,asOf:e.target.value}))}
+                      className="px-2 py-1 border border-amber-200 rounded-lg bg-white"/>
+                    <span className={parsed.asOfFound?"text-emerald-700 font-semibold":"text-amber-700 font-semibold"}>
+                      {parsed.asOfFound?"read from PDF":"not found — check"}</span>
                   </div>
                   <div className="grid grid-cols-2 gap-3 text-sm">
                     <div className="bg-white rounded-lg p-3 border border-red-100">
