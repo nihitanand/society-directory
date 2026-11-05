@@ -59,7 +59,7 @@ const DB = firebase.database();
 const DB_PATH = "society/contacts/v1";
 const DUES_PATH = "society/dues/v1";
 const ADMIN_PASSWORD = "ccpt@123";
-const APP_VERSION = "v3.1";
+const APP_VERSION = "v3.2";
 
 const { useState, useEffect } = React;
 
@@ -301,7 +301,8 @@ const tallyDateISO=(s)=>{const m=/^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/.exec(s||"")
   const mo=LG_MON[m[2].toLowerCase()]; if(mo===undefined) return null; return "20"+m[3]+"-"+pad2(mo+1)+"-"+pad2(Number(m[1]));};
 async function parseLedgerPdf(pdf, onProgress){
   const AMT=/^[\d,]+\.\d{2}$/;
-  const L={}, order=[]; let cur=null, xDr=null, xCr=null;
+  const L={}, order=[]; let cur=null, xDr=null, xCr=null, period=null;
+  const others={}; let curOther=null;   /* non-flat ledgers, e.g. Suspense */
   for(let p=1;p<=pdf.numPages;p++){
     const page=await pdf.getPage(p); const tc=await page.getTextContent();
     const toks=[];
@@ -316,13 +317,25 @@ async function parseLedgerPdf(pdf, onProgress){
     let lastDate = cur ? L[cur].lastDate : null;
     for(const ln of lines){
       const words=ln.t.map(t=>t.t); const text=words.join(" "); const flat=text.replace(/\s+/g,"").toLowerCase();
+      if(!period){ const pm=/(\d{1,2}-[A-Za-z]{3}-\d{2})\s+to\s+(\d{1,2}-[A-Za-z]{3}-\d{2})/.exec(text);
+        if(pm) period={from:tallyDateISO(pm[1]), to:tallyDateISO(pm[2])}; }
+      if(/Ledger:/.test(text) && !/Ledger:\s*[AB]\s*-\s*\d/.test(text)){
+        const on=text.replace(/^.*Ledger:\s*/,"").replace(/\s*:\s*\d{1,2}-[A-Za-z]{3}-\d{2}.*$/,"").trim();
+        cur=null; curOther=on; others[on]=others[on]||{name:on,closing:null}; continue; }
       const lm=/Ledger:\s*([AB])\s*-\s*(\d{1,4})\s*\(([^)\n:]*)/.exec(text);
       if(lm){ const key=lm[1]+"-"+lm[2].padStart(4,"0")+"|"+lm[3].trim();
         if(!L[key]){ L[key]={unitNo:"CCPR"+lm[1]+lm[2].padStart(4,"0"),tower:lm[1],name:lm[3].trim(),tx:[],closes:[],lastDate:null}; order.push(key); }
+        curOther=null;
         if(cur!==key){ cur=key; lastDate=L[cur].lastDate; } continue; }
       const dH=ln.t.find(t=>t.t==="Debit"), cH=ln.t.find(t=>t.t==="Credit");
       if(dH&&cH){ xDr=dH.x1; xCr=cH.x1; continue; }
-      if(!cur) continue;
+      if(!cur){
+        if(curOther && flat.indexOf("closingbalance")>=0){
+          ln.t.forEach(t=>{ if(!AMT.test(t.t)||xDr===null) return; const v=Number(t.t.replace(/,/g,""));
+            /* "To Closing Balance" in Dr column => ledger holds a credit balance */
+            if(Math.abs(t.x1-xDr)<=15) others[curOther].closing=-v; else if(Math.abs(t.x1-xCr)<=15) others[curOther].closing=v; });
+        }
+        continue; }
       if(flat.indexOf("carriedover")>=0||flat.indexOf("broughtforward")>=0) continue;
       if(ln.t.length && ln.t[0].x0<90){ const iso=tallyDateISO(ln.t[0].t); if(iso) lastDate=iso; }
       const head=words.slice(0,3); const isTo=head.indexOf("To")>=0, isBy=head.indexOf("By")>=0;
@@ -330,8 +343,12 @@ async function parseLedgerPdf(pdf, onProgress){
       let dr=0, cr=0, side=null, amt=0;
       ln.t.forEach(t=>{ if(!AMT.test(t.t)||xDr===null) return; const v=Number(t.t.replace(/,/g,""));
         if(Math.abs(t.x1-xDr)<=15){ dr+=v; side="Dr"; amt=v; } else if(Math.abs(t.x1-xCr)<=15){ cr+=v; side="Cr"; amt=v; } });
-      if(flat.indexOf("closingbalance")>=0||flat.indexOf("openingbalance")>=0){
-        if(side) L[cur].closes.push([lastDate||"", flat.indexOf("closing")>=0?"close":"open", side, amt]); continue; }
+      if(flat.indexOf("closingbalance")>=0){
+        if(side) L[cur].closes.push([lastDate||"", "close", side, amt]); continue; }
+      if(flat.indexOf("openingbalance")>=0){
+        /* arrears brought forward into this ledger period: a real amount owed (or held), not a check figure */
+        if(dr||cr) L[cur].tx.push([lastDate||"", Math.round(dr*100)/100, Math.round(cr*100)/100, "Opening", ""]);
+        continue; }
       if(dr===0&&cr===0) continue;
       let vch="", vno="";
       for(let i=0;i<words.length;i++){ if(["Sales","Receipt","Journal","Payment","Contra"].indexOf(words[i])>=0){ vch=words[i]; vno=words[i+1]&&!AMT.test(words[i+1])?words[i+1]:""; break; } }
@@ -347,24 +364,36 @@ async function parseLedgerPdf(pdf, onProgress){
     const c=cl[cl.length-1]; const exp=c[2]==="Cr"?c[3]:-c[3];
     const b=l.tx.filter(t=>t[0]&&t[0]<=c[0]).reduce((s,t)=>s+t[1]-t[2],0);
     if(Math.abs(b-exp)<0.02) ok++; else { bad++; badList.push(l.tower+"-"+l.unitNo.slice(5)); } });
-  return {ledgers, latest, check:{ok,bad,nomark,badList}};
+  return {ledgers, latest, period, others:Object.keys(others).map(k=>others[k]), check:{ok,bad,nomark,badList}};
 }
 function computeAgeing(tx, asof){
   const mm=s=>Number(s.slice(0,4))*12+Number(s.slice(5,7))-1;
+  const dnum=s=>Date.UTC(Number(s.slice(0,4)),Number(s.slice(5,7))-1,Number(s.slice(8,10)))/86400000;
   const A=mm(asof);
   const rows=tx.filter(t=>t[0]&&t[0]<=asof).slice().sort((a,b)=>a[0].localeCompare(b[0]));
   const bal=Math.round(rows.reduce((s,t)=>s+t[1]-t[2],0)*100)/100;
   let credit=rows.reduce((s,t)=>s+t[2],0);
-  const deb=rows.filter(t=>t[1]>0).map(t=>[t[0],t[1]]);
+  const deb=rows.filter(t=>t[1]>0).map(t=>[t[0],t[1],t[3]==="Opening"]);
   deb.forEach(d=>{ const u=Math.min(d[1],credit); d[1]-=u; credit-=u; });
-  const B={cur:0,b12:0,b35:0,b6:0}; let oldest=null;
+  const B={cur:0,b12:0,b35:0,b611:0,b12p:0}; let oldest=null, oldestOpening=false;
   deb.forEach(d=>{ if(d[1]<=0.005) return; const m=A-mm(d[0]);
-    if(m<=0) B.cur+=d[1]; else if(m<=2) B.b12+=d[1]; else if(m<=5) B.b35+=d[1]; else B.b6+=d[1];
-    if(d[1]>10 && !oldest) oldest=d[0]; });
-  const months = (bal>=10 && oldest) ? (A-mm(oldest)+1) : 0;
+    if(m<=0) B.cur+=d[1]; else if(m<=2) B.b12+=d[1]; else if(m<=5) B.b35+=d[1]; else if(m<=11) B.b611+=d[1]; else B.b12p+=d[1];
+    if(d[1]>10 && !oldest){ oldest=d[0]; oldestOpening=d[2]; } });
+  const live = bal>=10 && oldest;
   const r2=v=>Math.round(v*100)/100;
-  return {bal, oldest: (bal>=10&&oldest)?oldest.slice(0,7):"", months, cur:r2(B.cur), b12:r2(B.b12), b35:r2(B.b35), b6:r2(B.b6)};
+  return {bal, lots: deb.filter(d=>d[1]>0.005).map(d=>[d[0],r2(d[1])]),
+          oldest: live?oldest.slice(0,7):"", oldestDate: live?oldest:"", oldestOpening: live?oldestOpening:false,
+          months: live?(A-mm(oldest)+1):0, days: live?Math.round(dnum(asof)-dnum(oldest)):0,
+          cur:r2(B.cur), b12:r2(B.b12), b35:r2(B.b35), b611:r2(B.b611), b12p:r2(B.b12p), b6:r2(B.b611+B.b12p)};
 }
+/* display name: uniform casing, honorifics dropped (Dr. kept) */
+const NAME_KEEP={"HUF":"HUF","W/O":"W/O","S/O":"S/O","D/O":"D/O","M/S":"M/s","DR":"Dr.","DR.":"Dr.","MR":"Mr.","MR.":"Mr.","MS":"Ms.","MS.":"Ms.","MRS":"Mrs.","MRS.":"Mrs.","PVT":"Pvt","LTD":"Ltd","LTD.":"Ltd."};
+const niceName = n => String(n||"").split(" / ").map(part => {
+  const t = part.split(/\s+/).filter(Boolean).map(w => { const u=w.toUpperCase();
+    if(NAME_KEEP[u]) return NAME_KEEP[u];
+    if(u[0]==="(" && u[u.length-1]===")" && NAME_KEEP[u.slice(1,-1)]) return "("+NAME_KEEP[u.slice(1,-1)]+")";
+    return w.charAt(0).toUpperCase()+w.slice(1).toLowerCase(); }).join(" ");
+  return t.replace(/^(Mr\.|Ms\.|Mrs\.)\s+/,""); }).join(" / ");
 /* Firebase-safe ledger: flats keyed by unitNo, tx as arrays */
 const normLedgerFlats = raw => {
   const out = {};
@@ -602,6 +631,106 @@ function AgeLine({age}){
   if(!age || !age.oldest) return null;
   return <span className={`text-[11px] font-bold ${age.months>=6?"text-red-700":age.months>=3?"text-amber-700":"text-gray-500"}`}>
     Unpaid since {fmtMon(age.oldest)} · {age.months}m</span>;
+}
+
+
+/* ══════════ LEDGER AGEING REPORT (per tower) ══════════ */
+const AGE_THRESHOLDS = [[30,"1 month"],[60,"2 months"],[90,"3 months"],[180,"6 months"],[365,"12 months"]];
+function buildAgeingRows(ledger, records, tower, minDays, minAmt){
+  if(!ledger || !ledger.flats || !ledger.meta) return [];
+  const asof = ledger.meta.asofOverride || ledger.meta.asof;
+  const dnum=s=>Date.UTC(Number(s.slice(0,4)),Number(s.slice(5,7))-1,Number(s.slice(8,10)))/86400000;
+  const recMap={}; records.forEach(r=>{ recMap[r.unitNo]=r; });
+  const out=[];
+  Object.keys(ledger.flats).forEach(u=>{
+    if(u.slice(4,5)!==tower) return;
+    const f=ledger.flats[u]; const a=computeAgeing(f.tx, asof);
+    if(a.bal<10 || a.days<=minDays) return;
+    const overdue=a.lots.filter(l=>dnum(asof)-dnum(l[0])>minDays).reduce((s,l)=>s+l[1],0);
+    if(overdue<minAmt) return;
+    const rec=recMap[u]||{};
+    const dirWins=(rec.status==="Confirmed"||rec.status==="Updated") && rec.ownerName;
+    const rc=f.tx.filter(t=>t[0]&&t[0]<=asof&&t[2]>0&&t[3]==="Receipt").sort((x,y)=>x[0].localeCompare(y[0]));
+    out.push({unitNo:u, flat:tower+"-"+u.slice(5), name:niceName(dirWins?rec.ownerName:f.names.join(" / ")),
+      mobile:firstMobile(rec.ownerMobile), overdue, ...a,
+      last: rc.length ? fmtD(rc[rc.length-1][0]) : "—"});
+  });
+  return out;
+}
+function downloadAgeingPdf(ledger, records, tower, minDays, minAmt, withMobile, sortBy){
+  if(!window.jspdf || !window.jspdf.jsPDF) return null;
+  const asof = ledger.meta.asofOverride || ledger.meta.asof;
+  const all = buildAgeingRows(ledger, records, tower, -1, 0);           /* every debit flat in tower */
+  const rows = buildAgeingRows(ledger, records, tower, minDays, minAmt);
+  const SORT={amt:(a,b)=>b.bal-a.bal, flat:(a,b)=>a.unitNo.localeCompare(b.unitNo), age:(a,b)=>b.days-a.days||b.bal-a.bal};
+  rows.sort(SORT[sortBy]||SORT.amt);
+  const thr=(AGE_THRESHOLDS.find(t=>t[0]===minDays)||[minDays,minDays+" days"])[1];
+  const cut=new Date(asof+"T00:00:00"); cut.setDate(cut.getDate()-minDays);
+  const cutMon=cut.toLocaleDateString("en-IN",{month:"long",year:"numeric"});
+  const mon=(off)=>{ const d=new Date(asof+"T00:00:00"); d.setDate(1); d.setMonth(d.getMonth()-off);
+    return d.toLocaleDateString("en-IN",{month:"short"})+"-"+String(d.getFullYear()).slice(2); };
+  const doc=new window.jspdf.jsPDF({orientation:"l",unit:"mm",format:"a4"});
+  const W=doc.internal.pageSize.getWidth(), M=14, NAVY=[26,37,47], GREY=[85,85,85], PINK=[254,202,202];
+  let y=14;
+  doc.setFont("helvetica","bold"); doc.setFontSize(14); doc.setTextColor(...NAVY);
+  doc.text("CCPT Awasiya Parisar Sanrakshan Association",W/2,y,{align:"center"}); y+=4.8;
+  doc.setFont("helvetica","normal"); doc.setFontSize(8.6); doc.setTextColor(...GREY);
+  doc.text("The Residency Apartment, City Centre, Patna",W/2,y,{align:"center"}); y+=3;
+  doc.setDrawColor(...NAVY); doc.setLineWidth(0.6); doc.line(M,y,W-M,y); y+=6.5;
+  doc.setFont("helvetica","bold"); doc.setFontSize(12.5); doc.setTextColor(...NAVY);
+  doc.text("TOWER "+tower+" — DUES OUTSTANDING FOR MORE THAN "+thr.toUpperCase(),W/2,y,{align:"center"}); y+=4.8;
+  doc.setFont("helvetica","normal"); doc.setFontSize(8.6); doc.setTextColor(...GREY);
+  doc.text("As on "+fmtDL(asof)+"   |   Source: Tally member ledgers, updated as per bank statement",W/2,y,{align:"center"}); y+=4;
+  const crit="Criterion: flats whose oldest unpaid maintenance bill is more than "+minDays+" days old — i.e. bills from "+cutMon+" or earlier remain unpaid"+
+    (minAmt>0?", with at least Rs. "+Number(minAmt).toLocaleString("en-IN")+" outstanding from those bills":"")+". Payments are applied to the oldest bills first. Amounts include all bills raised up to "+fmtDL(asof)+".";
+  doc.setFillColor(254,243,199); doc.setDrawColor(217,180,74);
+  const cl=doc.splitTextToSize(crit,W-2*M-8); doc.roundedRect(M,y,W-2*M,cl.length*3.8+4,1.2,1.2,"FD");
+  doc.setFontSize(8.2); doc.setTextColor(146,64,14); doc.text(cl,M+4,y+4.6); y+=cl.length*3.8+8;
+  const sum=k=>rows.reduce((s,r)=>s+r[k],0); const tot=sum("bal"), totAll=all.reduce((s,r)=>s+r.bal,0);
+  const BK=[["cur","Current ("+mon(0)+")"],["b12","1–2 m ("+mon(2)+" – "+mon(1)+")"],["b35","3–5 m ("+mon(5)+" – "+mon(3)+")"],
+            ["b611","6–11 m ("+mon(11)+" – "+mon(6)+")"],["b12p","12+ m (to "+mon(12)+")"]];
+  doc.autoTable({startY:y, theme:"grid", margin:{left:M,right:M},
+    head:[["Flats (> "+thr+")","Amount Outstanding","Share of Tower "+tower+" Dues"].concat(BK.map(b=>b[1]))],
+    body:[[rows.length+" of "+all.length, moneyS(tot), (totAll?Math.round(tot/totAll*100):0)+"%"].concat(BK.map(b=>moneyS(sum(b[0]))))],
+    styles:{fontSize:8,halign:"center",valign:"middle",cellPadding:1.8,lineColor:[154,165,173],lineWidth:0.2,textColor:NAVY},
+    headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:7.6},
+    didParseCell:d=>{ if(d.section!=="body") return; if(d.column.index<=2){d.cell.styles.fillColor=[254,226,226];d.cell.styles.fontStyle="bold";}
+      if(d.column.index>=6) d.cell.styles.fillColor=PINK; }});
+  y=doc.lastAutoTable.finalY+4;
+  const head=["Sl.","Flat","Owner"].concat(withMobile?["Mobile"]:[]).concat(["Unpaid Since","Months","Current","1–2 m","3–5 m","6–11 m","12+ m","Last Payment","Total Due"]);
+  const off=withMobile?1:0;
+  const body=rows.map((r,i)=>[String(i+1), r.flat, r.name].concat(withMobile?[r.mobile||"—"]:[]).concat([
+    r.oldestOpening?"Before "+fmtMon(r.oldest):fmtMon(r.oldest), String(r.months)+(r.oldestOpening?"+":"")]).concat(
+    ["cur","b12","b35","b611","b12p"].map(k=>r[k]>0.004?moneyS(r[k]):"—")).concat([r.last, moneyS(r.bal)]));
+  const foot=[["","","Total — Tower "+tower].concat(withMobile?[""]:[]).concat(["",""]).concat(["cur","b12","b35","b611","b12p"].map(k=>moneyS(sum(k)))).concat(["",moneyS(tot)])];
+  const cw = withMobile ? [8,14,48,21,18,12,20,21,21,22,22,18,24] : [9,15,58,19,13,22,22,22,24,24,18,23];
+  const cs={}; cw.forEach((w,i)=>{ cs[i]={cellWidth:w}; });
+  /* columns: 0 Sl, 1 Flat, 2 Owner, [3 Mobile], 3+off Unpaid, 4+off Months, 5..9+off buckets, 10+off Last, 11+off Total */
+  [0,1,4+off,10+off].forEach(i=>{ cs[i].halign="center"; }); for(let i=5+off;i<=9+off;i++) cs[i].halign="right";
+  cs[11+off].halign="right"; cs[11+off].fontStyle="bold"; cs[1].fontStyle="bold"; if(off) cs[3].halign="center";
+  doc.autoTable({startY:y, head:[head], body: body.length?body:[[ "", "", "No flats meet this criterion" ]], foot: body.length?foot:undefined,
+    theme:"grid", margin:{left:M,right:M}, columnStyles:cs,
+    styles:{fontSize:7.6,cellPadding:1.25,valign:"middle",lineColor:[154,165,173],lineWidth:0.2,overflow:"linebreak"},
+    headStyles:{fillColor:NAVY,textColor:255,fontStyle:"bold",fontSize:7.4},
+    footStyles:{fillColor:[229,231,235],textColor:NAVY,fontStyle:"bold"},
+    alternateRowStyles:{fillColor:[244,247,250]},
+    didParseCell:d=>{ if(d.section==="body" && (d.column.index===8+off||d.column.index===9+off) && d.cell.raw!=="—") d.cell.styles.fillColor=PINK; }});
+  let yy=doc.lastAutoTable.finalY+4.5;
+  const notes=["Notes. Balances are as per each flat's Tally ledger up to "+fmtDL(asof)+", after the latest bank statement entries. Receipts are set against the oldest unpaid bills first; residual amounts under Rs. 10 from rounding are ignored. Where a flat changed hands, the outgoing and incoming owners' ledgers are combined. Payments made after "+fmtDL(asof)+" are not reflected. Any resident who believes a figure is incorrect may contact the Property Manager with payment details."];
+  const oth=(ledger.meta.others?toArr(ledger.meta.others):[]).filter(o=>o && Math.abs(Number(o.closing||0))>0.005);
+  if(oth.length) notes.push(oth.map(o=>o.name+" ledger holds "+rs(Math.abs(o.closing))+(o.closing<0?" in receipts not yet allocated to any flat":"")).join("; ")+" — once allocated, the flats concerned will show lower dues.");
+  if(rows.some(r=>r.oldestOpening)) notes.push("'Before' and '+' mark arrears carried forward as a single opening balance, whose original bill dates are not available.");
+  doc.setFontSize(7.4); doc.setTextColor(...GREY);
+  notes.forEach(n=>{ const t=doc.splitTextToSize(n,W-2*M); if(yy+t.length*3.1>doc.internal.pageSize.getHeight()-12.5){doc.addPage(); yy=16;} doc.text(t,M,yy); yy+=t.length*3.1+1; });
+  const pages=doc.internal.getNumberOfPages();
+  for(let i=1;i<=pages;i++){ doc.setPage(i); const H=doc.internal.pageSize.getHeight();
+    doc.setDrawColor(204,204,204); doc.setLineWidth(0.2); doc.line(M,H-11,W-M,H-11);
+    doc.setFontSize(7.2); doc.setTextColor(...GREY);
+    doc.text("CCPT — Tower "+tower+" dues outstanding > "+thr+", as on "+fmtD(asof)+(withMobile?" — CONFIDENTIAL, contains mobile numbers":""),M,H-7);
+    doc.text("Page "+i+" of "+pages,W-M,H-7,{align:"right"}); }
+  const ds=asof.slice(8,10)+"."+asof.slice(5,7)+"."+asof.slice(0,4);
+  doc.save("CCPT_Tower_"+tower+"_Dues_Over_"+thr.replace(" ","_")+"_"+ds+(withMobile?"":"")+".pdf");
+  return {n:rows.length, tot};
 }
 
 /* ══════════ CALLS MODULE (used by #calls and admin Calls tab) ══════════ */
@@ -1007,6 +1136,12 @@ function App() {
   const [crTo,        setCrTo]        = useState(addDaysISO(weekStartISO(todayISO()),6));
   const [crMobile,    setCrMobile]    = useState(false);
   const [crHistory,   setCrHistory]   = useState(true);
+  const [agTower,     setAgTower]     = useState("Both");
+  const [agDays,      setAgDays]      = useState(90);
+  const [agMin,       setAgMin]       = useState("1000");
+  const [agMobile,    setAgMobile]    = useState(false);
+  const [agSort,      setAgSort]      = useState("amt");
+  const [agAsof,      setAgAsof]      = useState("");
   const [moveTo,      setMoveTo]      = useState("");
 
   /* deep link: #admin opens admin login directly */
@@ -2065,7 +2200,25 @@ function App() {
       const flats = {};
       r.ledgers.forEach(l => { const f = flats[l.unitNo] = flats[l.unitNo] || {names:[], tx:[]};
         if(f.names.indexOf(l.name)<0) f.names.push(l.name); f.tx = f.tx.concat(l.tx); });
-      setLedgerParsed({flats, ledgers:r.ledgers.length, latest:r.latest, asof:r.latest, check:r.check, fileName:file.name});
+      /* keep true bill dates: if this ledger starts with an Opening Balance that equals the stored
+         ledger's balance the day before, replace the lump with the stored earlier transactions */
+      const pStart = r.period && r.period.from ? r.period.from : null;
+      let spliced=0, lumped=0;
+      if(pStart){
+        Object.keys(flats).forEach(u => {
+          const f=flats[u]; const op=f.tx.filter(t=>t[3]==="Opening");
+          if(!op.length) return;
+          const opBal=op.reduce((s,t)=>s+t[1]-t[2],0);
+          const prev = ledger && ledger.flats ? ledger.flats[u] : null;
+          const prevTx = prev ? prev.tx.filter(t=>t[0] && t[0]<pStart && t[3]!=="Opening") : [];
+          const prevBal = prevTx.reduce((s,t)=>s+t[1]-t[2],0);
+          if(prevTx.length && Math.abs(prevBal-opBal)<0.02){ f.tx = prevTx.concat(f.tx.filter(t=>t[3]!=="Opening")); spliced++; }
+          else if(Math.abs(opBal)>0.005) lumped++;
+        });
+      }
+      const sus = (r.others||[]).filter(o=>o.closing!==null && Math.abs(o.closing)>0.005);
+      setLedgerParsed({flats, ledgers:r.ledgers.length, latest:r.latest, asof:(r.period&&r.period.to)||r.latest,
+                       period:r.period, others:sus, spliced, lumped, check:r.check, fileName:file.name});
     } catch(e){ console.error(e); notify("Could not read this ledger PDF","error"); }
     setLedgerBusy(null);
   };
@@ -2079,7 +2232,9 @@ function App() {
   const commitLedger = () => {
     if(!ledgerParsed) return;
     const payload = {meta:{asof:ledgerParsed.asof, latestTxn:ledgerParsed.latest, uploadedAt:tsNow(), fileName:ledgerParsed.fileName,
-                           ledgers:ledgerParsed.ledgers, verified:ledgerParsed.check.ok, mismatched:ledgerParsed.check.bad},
+                           ledgers:ledgerParsed.ledgers, verified:ledgerParsed.check.ok, mismatched:ledgerParsed.check.bad,
+                           periodFrom:(ledgerParsed.period&&ledgerParsed.period.from)||"", spliced:ledgerParsed.spliced||0,
+                           lumped:ledgerParsed.lumped||0, others:(ledgerParsed.others||[]).map(o=>({name:o.name,closing:o.closing}))},
                      flats:ledgerParsed.flats};
     setSyncSt("saving");
     DB.ref(LEDGER_PATH).set(payload)
@@ -2728,6 +2883,15 @@ function App() {
           <p className="text-sm text-gray-400 mb-6">Generate and download reports for committee use.</p>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
 
+            <div className="bg-white rounded-2xl border border-red-100 shadow-sm p-5">
+              <div className="text-2xl mb-2">⏳</div>
+              <h3 className="font-bold text-amber-900 mb-1">Ageing Report (Ledger)</h3>
+              <p className="text-xs text-gray-500 mb-1">Tower-wise dues overdue more than 1, 2, 3, 6 or 12 months, with ageing columns — built from the uploaded ledger.</p>
+              <p className="text-xs text-amber-700 font-semibold mb-4">{ledger&&ledger.meta ? "Ledger as on "+fmtD(ledger.meta.asof)+" · share-safe by default" : "Upload a ledger PDF in the Dues tab first"}</p>
+              <button onClick={()=>{ setAgAsof(ledger&&ledger.meta?ledger.meta.asof:""); setModal("ageing"); }} disabled={!(ledger&&ledger.meta)}
+                className="btn-gold w-full py-2.5 rounded-xl text-sm disabled:opacity-40">Generate</button>
+            </div>
+
             <div className="bg-white rounded-2xl border border-emerald-100 shadow-sm p-5">
               <div className="text-2xl mb-2">📞</div>
               <h3 className="font-bold text-amber-900 mb-1">Dues Calling Report</h3>
@@ -2866,6 +3030,18 @@ function App() {
                   <div className="bg-white rounded-lg p-3 border border-red-100"><div className="text-xs text-gray-400 font-bold uppercase">3+ months</div>
                     <div className="font-black text-red-700">{ledgerPreview.g3} · {money(ledgerPreview.g3t)}</div></div>
                 </div>
+                {(ledgerParsed.spliced>0 || ledgerParsed.lumped>0) && (
+                  <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-800">
+                    {ledgerParsed.spliced>0 && <div>✓ True bill dates kept for {ledgerParsed.spliced} flats (opening balances match the previous ledger).</div>}
+                    {ledgerParsed.lumped>0 && <div>{ledgerParsed.lumped} flats' arrears before {fmtDL(ledgerParsed.period&&ledgerParsed.period.from)} are shown as one opening amount ("Before {fmtMon((ledgerParsed.period&&ledgerParsed.period.from||"").slice(0,7))}").</div>}
+                  </div>
+                )}
+                {ledgerParsed.others && ledgerParsed.others.length>0 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800">
+                    {ledgerParsed.others.map(o=>(
+                      <div key={o.name}><b>{o.name}:</b> {money(Math.abs(o.closing))} {o.closing<0?"unallocated receipts (credit)":"debit"} — not linked to any flat.</div>))}
+                  </div>
+                )}
                 <Fld label="Ledger as on (bank statement date)">
                   <input type="date" value={ledgerParsed.asof} onChange={e=>setLedgerParsed(lp=>({...lp,asof:e.target.value}))} className={INP}/>
                 </Fld>
@@ -2876,6 +3052,47 @@ function App() {
               </>
             )}
           </div>
+        </Modal>
+
+        {/* Ageing Report Modal */}
+        <Modal open={modal==="ageing"} onClose={()=>setModal(null)} title="⏳ Ageing Report (Ledger)">
+          {ledger && ledger.meta && (()=>{
+            const L2={...ledger, meta:{...ledger.meta, asofOverride: agAsof||ledger.meta.asof}};
+            const minA=Number(agMin)||0;
+            const pv=["A","B"].map(t=>{ const rws=buildAgeingRows(L2, records, t, agDays, minA);
+              return {t, n:rws.length, amt:rws.reduce((s,r)=>s+r.bal,0)}; });
+            return (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <Fld label="Tower"><select value={agTower} onChange={e=>setAgTower(e.target.value)} className={INP}>
+                  <option value="Both">Both (2 PDFs)</option><option value="A">Tower A</option><option value="B">Tower B</option></select></Fld>
+                <Fld label="Overdue more than"><select value={agDays} onChange={e=>setAgDays(Number(e.target.value))} className={INP}>
+                  {AGE_THRESHOLDS.map(([d,l])=><option key={d} value={d}>{l} ({d} days)</option>)}</select></Fld>
+                <Fld label="Min. overdue amount (₹)"><input type="number" value={agMin} onChange={e=>setAgMin(e.target.value)} className={INP}/></Fld>
+                <Fld label="As on"><input type="date" value={agAsof} onChange={e=>setAgAsof(e.target.value)} className={INP}/></Fld>
+              </div>
+              <Fld label="Sort"><select value={agSort} onChange={e=>setAgSort(e.target.value)} className={INP}>
+                <option value="amt">Amount — high to low</option><option value="age">Months overdue — oldest first</option><option value="flat">Flat No.</option></select></Fld>
+              <label className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer ${agMobile?"border-red-200 bg-red-50":"border-emerald-200 bg-emerald-50"}`}>
+                <input type="checkbox" checked={agMobile} onChange={e=>setAgMobile(e.target.checked)} className="w-4 h-4 accent-amber-700"/>
+                <span className="text-sm font-semibold text-amber-900 flex-1">Include mobile numbers</span>
+                <span className={`text-xs font-bold ${agMobile?"text-red-700":"text-emerald-700"}`}>{agMobile?"Committee only":"Share-safe"}</span></label>
+              <div className="grid grid-cols-2 gap-2">
+                {pv.filter(x=>agTower==="Both"||x.t===agTower).map(x=>(
+                  <div key={x.t} className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
+                    <div className="text-[11px] font-bold text-gray-400 uppercase">Tower {x.t}</div>
+                    <div className="font-black text-amber-900">{x.n} flats</div>
+                    <div className="text-sm font-bold text-red-700">{money(x.amt)}</div></div>))}
+              </div>
+              <div className="flex gap-3 pt-2 border-t border-amber-100">
+                <button onClick={()=>setModal(null)} className="flex-1 py-2.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl text-sm font-semibold">Cancel</button>
+                <button onClick={()=>{
+                    const ts=agTower==="Both"?["A","B"]:[agTower];
+                    ts.forEach((t,i)=>setTimeout(()=>{ downloadAgeingPdf(L2, records, t, agDays, minA, agMobile, agSort); }, i*900));
+                    setModal(null); notify("✅ "+(ts.length>1?"2 PDFs":"PDF")+" downloading"); }}
+                  className="btn-gold flex-1 py-2.5 rounded-xl text-sm">📥 Download</button>
+              </div>
+            </div> ); })()}
         </Modal>
 
         {/* Calling Report Modal */}
