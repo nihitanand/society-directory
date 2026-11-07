@@ -367,11 +367,19 @@ async function parseLedgerPdf(pdf, onProgress){
     if(Math.abs(b-exp)<0.02) ok++; else { bad++; badList.push(l.tower+"-"+l.unitNo.slice(5)); } });
   return {ledgers, latest, period, others:Object.keys(others).map(k=>others[k]), check:{ok,bad,nomark,badList}};
 }
+/* same-day debit reversed by a non-receipt credit of the same amount (e.g. ₹12,000 paver bill PC/.. reversed 01-05-26) — drop both */
+function netReversals(tx){
+  const out=tx.slice(), gone=new Set();
+  out.forEach((c,ci)=>{ if(!(c[2]>0) || c[3]==="Receipt" || gone.has(ci)) return;
+    const di=out.findIndex((d,i)=>!gone.has(i) && i!==ci && d[0]===c[0] && d[1]>0 && Math.abs(d[1]-c[2])<0.005);
+    if(di>=0){ gone.add(ci); gone.add(di); } });
+  return out.filter((t,i)=>!gone.has(i));
+}
 function computeAgeing(tx, asof){
   const mm=s=>Number(s.slice(0,4))*12+Number(s.slice(5,7))-1;
   const dnum=s=>Date.UTC(Number(s.slice(0,4)),Number(s.slice(5,7))-1,Number(s.slice(8,10)))/86400000;
   const A=mm(asof);
-  const rows=tx.filter(t=>t[0]&&t[0]<=asof).slice().sort((a,b)=>a[0].localeCompare(b[0]));
+  const rows=netReversals(tx.filter(t=>t[0]&&t[0]<=asof)).sort((a,b)=>a[0].localeCompare(b[0]));
   const bal=Math.round(rows.reduce((s,t)=>s+t[1]-t[2],0)*100)/100;
   let credit=rows.reduce((s,t)=>s+t[2],0);
   const deb=rows.filter(t=>t[1]>0).map(t=>[t[0],t[1],t[3]==="Opening"]);
@@ -494,7 +502,7 @@ function downloadStatementPdf(flatLabel, names, tx, asof){
   doc.setFontSize(9.5); doc.text("Flat "+flatLabel+"  —  "+names.join(" / "),W/2,y,{align:"center"}); y+=4.6;
   doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...GREY);
   doc.text("Transactions up to "+fmtDL(asof)+", as per Tally ledger",W/2,y,{align:"center"}); y+=4;
-  const rows=tx.filter(t=>t[0]&&t[0]<=asof).slice().sort((a,b)=>a[0].localeCompare(b[0]));
+  const rows=netReversals(tx.filter(t=>t[0]&&t[0]<=asof)).sort((a,b)=>a[0].localeCompare(b[0]));
   let bal=0;
   const body=rows.map((t,i)=>{ bal+=t[1]-t[2];
     const part = i===0 && t[3]==="Journal" ? "Opening arrears" :
@@ -741,7 +749,7 @@ const NOTICE_RATE = 0.12, NOTICE_GRACE = 30, NOTICE_PAY_DAYS = 7;
 /* receipts set against oldest bills; interest @12% p.a. simple on each unpaid amount from bill date+30 to deadline */
 function noticeCalc(tx, asof, deadline){
   const dnum=s=>Date.UTC(Number(s.slice(0,4)),Number(s.slice(5,7))-1,Number(s.slice(8,10)))/86400000;
-  const rows=tx.filter(t=>t[0]&&t[0]<=asof).slice().sort((a,b)=>a[0].localeCompare(b[0]));
+  const rows=netReversals(tx.filter(t=>t[0]&&t[0]<=asof)).sort((a,b)=>a[0].localeCompare(b[0]));
   let credit=rows.reduce((s,t)=>s+t[2],0);
   const bills=rows.filter(t=>t[1]>0).map(t=>({date:t[0], amt:t[1], unpaid:t[1], typ:t[3], vno:t[4]}));
   bills.forEach(b=>{ const u=Math.min(b.unpaid,credit); b.unpaid-=u; credit-=u; });
